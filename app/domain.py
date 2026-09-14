@@ -15,10 +15,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 #: 航班占用两端各外扩的安全余量（进场前 / 离场后各十分钟）。
 OCCUPANCY_BUFFER = timedelta(minutes=10)
+
+#: Python datetime 可表达范围的带 UTC 时区版本。
+_MIN_AWARE = datetime.min.replace(tzinfo=timezone.utc)
+_MAX_AWARE = datetime.max.replace(tzinfo=timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -63,12 +67,24 @@ class WorkWindowReport:
 
 
 def buffered(occupancy: Occupancy) -> tuple[datetime, datetime]:
-    """返回航班占用两端各扩展十分钟后的半开区间。"""
+    """返回航班占用两端各扩展十分钟后的半开区间。
 
-    return (
-        occupancy.start - OCCUPANCY_BUFFER,
-        occupancy.end + OCCUPANCY_BUFFER,
-    )
+    占用时间接近年份上下界（``0001`` / ``9999``）时，直接相减/相加会
+    溢出；此时把超出可表达范围的端点钳制到 ``datetime`` 的最小/最大值，
+    即把无法表示的余量视为一直延伸到可表达边界，从而照常给出放行结论。
+    注意必须先按阈值判断再运算——溢出发生在加减那一刻，无法事后比较。
+    """
+
+    if occupancy.start <= _MIN_AWARE + OCCUPANCY_BUFFER:
+        start = _MIN_AWARE
+    else:
+        start = occupancy.start - OCCUPANCY_BUFFER
+
+    if occupancy.end >= _MAX_AWARE - OCCUPANCY_BUFFER:
+        end = _MAX_AWARE
+    else:
+        end = occupancy.end + OCCUPANCY_BUFFER
+    return start, end
 
 
 def overlap(

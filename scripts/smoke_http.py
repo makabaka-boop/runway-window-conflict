@@ -96,6 +96,34 @@ def main() -> int:
         "body", "work_windows", 2, "end"
     ) in locs, f"倒挂区间应为字段级错误，实际 loc 集合: {locs}"
 
+    # 4) 年份上下界：占用扩展余量会溢出可表达 datetime 范围，
+    #    服务必须钳制后照常返回结论（下界相接安全，上界窗落在缓冲内冲突）
+    edge = {
+        "runways": ["36L"],
+        "work_windows": [
+            {"runway": "36L", "start": "0001-01-01T00:20:00Z", "end": "0001-01-01T00:40:00Z"},
+            {"runway": "36L", "start": "9999-12-31T23:50:00Z", "end": "9999-12-31T23:59:59Z"},
+        ],
+        "occupancies": [
+            {"runway": "36L", "flight_id": "CA0001", "start": "0001-01-01T00:00:00Z", "end": "0001-01-01T00:10:00Z"},
+            {"runway": "36L", "flight_id": "CA9999", "start": "9999-12-31T23:40:00Z", "end": "9999-12-31T23:59:59Z"},
+        ],
+    }
+    status, body = request("POST", "/evaluate", edge)
+    assert_equal(status, 200, "年份边界请求状态码")
+    assert_equal(body[0]["conflicts"], [], "下界离场端相接：安全")
+    assert_equal(
+        body[1]["conflicts"],
+        [
+            {
+                "flight_id": "CA9999",
+                "overlap_start": "9999-12-31T23:50:00Z",
+                "overlap_end": "9999-12-31T23:59:59Z",
+            }
+        ],
+        "上界施工窗落在缓冲内：冲突",
+    )
+
     print("smoke_http: 全部断言通过")
     return 0
 

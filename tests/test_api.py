@@ -83,6 +83,66 @@ class TestEvaluateEndpoint:
         assert resp.status_code == 200
         assert resp.json() == []
 
+    def test_occupancy_near_year_lower_bound_returns_clearance(self) -> None:
+        # 占用从 0001 年第一分钟开始；扩展下溢时服务此前会 500。
+        # 离场缓冲到 00:20，施工 [00:20, 00:40) 端点相接 → 放行。
+        payload = {
+            "runways": ["36L"],
+            "work_windows": [
+                {"runway": "36L", "start": "0001-01-01T00:20:00Z", "end": "0001-01-01T00:40:00Z"},
+            ],
+            "occupancies": [
+                {"runway": "36L", "flight_id": "CA1", "start": "0001-01-01T00:00:00Z", "end": "0001-01-01T00:10:00Z"},
+            ],
+        }
+        resp = client.post("/evaluate", json=payload)
+        assert resp.status_code == 200
+        assert resp.json()[0]["conflicts"] == []
+
+    def test_occupancy_near_year_lower_bound_conflict_serializes_four_digit_year(self) -> None:
+        # 下界冲突交集的年份必须序列化为四位 "0001"，而非 "1"
+        payload = {
+            "runways": ["36L"],
+            "work_windows": [
+                {"runway": "36L", "start": "0001-01-01T00:19:59Z", "end": "0001-01-01T00:40:00Z"},
+            ],
+            "occupancies": [
+                {"runway": "36L", "flight_id": "CA1", "start": "0001-01-01T00:00:00Z", "end": "0001-01-01T00:10:00Z"},
+            ],
+        }
+        resp = client.post("/evaluate", json=payload)
+        assert resp.status_code == 200
+        assert resp.json()[0]["conflicts"] == [
+            {
+                "flight_id": "CA1",
+                "overlap_start": "0001-01-01T00:19:59Z",
+                "overlap_end": "0001-01-01T00:20:00Z",
+            }
+        ]
+        # 窗口自身回显也必须保持四位年份
+        assert resp.json()[0]["start"] == "0001-01-01T00:19:59Z"
+
+    def test_occupancy_near_year_upper_bound_returns_conflict(self) -> None:
+        # 占用到 9999 年末；扩展上溢时服务此前会 500
+        payload = {
+            "runways": ["36L"],
+            "work_windows": [
+                {"runway": "36L", "start": "9999-12-31T23:50:00Z", "end": "9999-12-31T23:59:59Z"},
+            ],
+            "occupancies": [
+                {"runway": "36L", "flight_id": "CA9", "start": "9999-12-31T23:40:00Z", "end": "9999-12-31T23:59:59Z"},
+            ],
+        }
+        resp = client.post("/evaluate", json=payload)
+        assert resp.status_code == 200
+        assert resp.json()[0]["conflicts"] == [
+            {
+                "flight_id": "CA9",
+                "overlap_start": "9999-12-31T23:50:00Z",
+                "overlap_end": "9999-12-31T23:59:59Z",
+            }
+        ]
+
 
 class TestFieldLevelErrors:
     def test_unknown_runway_is_field_error_with_no_partial_result(self) -> None:
@@ -168,6 +228,22 @@ class TestFieldLevelErrors:
             }
         )
         assert (("body", "work_windows", 0, "start"), "not_utc_z_seconds") in errors
+
+    def test_year_outside_representable_range_rejected(self) -> None:
+        for bad_time in ("0000-01-01T00:00:00Z", "10000-01-01T00:00:00Z"):
+            errors = _conflict_loc_types(
+                {
+                    "runways": ["36L"],
+                    "work_windows": [
+                        {"runway": "36L", "start": bad_time, "end": "2026-09-15T03:00:00Z"},
+                    ],
+                    "occupancies": [],
+                }
+            )
+            assert (
+                ("body", "work_windows", 0, "start"),
+                "not_utc_z_seconds",
+            ) in errors, bad_time
 
     def test_start_equals_end_rejected(self) -> None:
         errors = _conflict_loc_types(

@@ -74,10 +74,18 @@ def validate_utc_z_seconds(value: object) -> datetime:
 
 
 def serialize_utc_z_seconds(value: datetime) -> str:
-    """序列化为带 ``Z`` 的秒级 UTC 字符串。"""
+    """序列化为带 ``Z`` 的秒级 UTC 字符串。
+
+    手工拼年份：``strftime('%Y')`` 对公元 1000 年以前的年份不补零，
+    会把 0001 年输出成 ``1-...``，必须始终保证四位年份。
+    """
 
     aware = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-    return aware.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    aware = aware.astimezone(timezone.utc)
+    return (
+        f"{aware.year:04d}-{aware.month:02d}-{aware.day:02d}T"
+        f"{aware.hour:02d}:{aware.minute:02d}:{aware.second:02d}Z"
+    )
 
 
 #: 请求/响应用：入参只接受严格 Z 秒级字符串，出参序列化为 Z 秒级字符串。

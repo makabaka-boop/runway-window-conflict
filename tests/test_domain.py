@@ -185,3 +185,102 @@ class TestEvaluate:
             ],
         )
         assert reports[0].conflicts == ()
+
+
+class TestYearBoundaries:
+    """占用时间接近 0001 / 9999 年边界时，扩展余量不得导致报错。"""
+
+    def test_buffer_clamps_to_representable_bounds(self) -> None:
+        low = Occupancy(
+            "36L", "CA1",
+            datetime(1, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+            datetime(1, 1, 1, 0, 10, 0, tzinfo=timezone.utc),
+        )
+        assert buffered(low) == (
+            datetime.min.replace(tzinfo=timezone.utc),
+            datetime(1, 1, 1, 0, 20, 0, tzinfo=timezone.utc),
+        )
+
+        high = Occupancy(
+            "36L", "CA2",
+            datetime(9999, 12, 31, 23, 40, 0, tzinfo=timezone.utc),
+            datetime(9999, 12, 31, 23, 59, 59, tzinfo=timezone.utc),
+        )
+        assert buffered(high) == (
+            datetime(9999, 12, 31, 23, 30, 0, tzinfo=timezone.utc),
+            datetime.max.replace(tzinfo=timezone.utc),
+        )
+
+    def test_lower_bound_departure_side_touching_is_safe(self) -> None:
+        # 占用 00:00-00:10：进场前余量不可表示，钳制到可表达下界；
+        # 离场端缓冲到 00:20。施工 [00:20, 00:40) 恰在 00:20 相接 → 安全
+        reports = evaluate(
+            [WorkWindow("36L", datetime(1, 1, 1, 0, 20, tzinfo=timezone.utc),
+                        datetime(1, 1, 1, 0, 40, tzinfo=timezone.utc))],
+            [Occupancy("36L", "CA1",
+                       datetime(1, 1, 1, 0, 0, tzinfo=timezone.utc),
+                       datetime(1, 1, 1, 0, 10, tzinfo=timezone.utc))],
+        )
+        assert reports[0].conflicts == ()
+
+    def test_lower_bound_departure_side_one_second_incursion_conflicts(self) -> None:
+        # 施工 [00:19:59, 00:40) 侵入离场缓冲一秒
+        reports = evaluate(
+            [WorkWindow("36L", datetime(1, 1, 1, 0, 19, 59, tzinfo=timezone.utc),
+                        datetime(1, 1, 1, 0, 40, tzinfo=timezone.utc))],
+            [Occupancy("36L", "CA1",
+                       datetime(1, 1, 1, 0, 0, tzinfo=timezone.utc),
+                       datetime(1, 1, 1, 0, 10, tzinfo=timezone.utc))],
+        )
+        assert reports[0].conflicts == (
+            Conflict(
+                "CA1",
+                datetime(1, 1, 1, 0, 19, 59, tzinfo=timezone.utc),
+                datetime(1, 1, 1, 0, 20, tzinfo=timezone.utc),
+            ),
+        )
+
+    def test_lower_bound_window_inside_pre_arrival_buffer_conflicts(self) -> None:
+        # 从可表达起点开始的施工窗，落在被钳制的进场缓冲内 → 冲突，交集即施工窗
+        reports = evaluate(
+            [WorkWindow("36L", datetime(1, 1, 1, 0, 0, tzinfo=timezone.utc),
+                        datetime(1, 1, 1, 0, 5, tzinfo=timezone.utc))],
+            [Occupancy("36L", "CA1",
+                       datetime(1, 1, 1, 0, 0, tzinfo=timezone.utc),
+                       datetime(1, 1, 1, 0, 10, tzinfo=timezone.utc))],
+        )
+        assert reports[0].conflicts == (
+            Conflict(
+                "CA1",
+                datetime(1, 1, 1, 0, 0, tzinfo=timezone.utc),
+                datetime(1, 1, 1, 0, 5, tzinfo=timezone.utc),
+            ),
+        )
+
+    def test_upper_bound_window_inside_buffer_conflicts(self) -> None:
+        # 占用 23:40-23:59:59，扩展到 [23:30, 可表达上界)；施工 [23:50, 23:59:59)
+        reports = evaluate(
+            [WorkWindow("36L", datetime(9999, 12, 31, 23, 50, tzinfo=timezone.utc),
+                        datetime(9999, 12, 31, 23, 59, 59, tzinfo=timezone.utc))],
+            [Occupancy("36L", "CA9",
+                       datetime(9999, 12, 31, 23, 40, tzinfo=timezone.utc),
+                       datetime(9999, 12, 31, 23, 59, 59, tzinfo=timezone.utc))],
+        )
+        assert reports[0].conflicts == (
+            Conflict(
+                "CA9",
+                datetime(9999, 12, 31, 23, 50, tzinfo=timezone.utc),
+                datetime(9999, 12, 31, 23, 59, 59, tzinfo=timezone.utc),
+            ),
+        )
+
+    def test_upper_bound_touching_is_safe(self) -> None:
+        # 占用扩展起点 23:30；施工结束恰为 23:30 → 相接安全
+        reports = evaluate(
+            [WorkWindow("36L", datetime(9999, 12, 31, 22, 0, tzinfo=timezone.utc),
+                        datetime(9999, 12, 31, 23, 30, tzinfo=timezone.utc))],
+            [Occupancy("36L", "CA9",
+                       datetime(9999, 12, 31, 23, 40, tzinfo=timezone.utc),
+                       datetime(9999, 12, 31, 23, 59, 59, tzinfo=timezone.utc))],
+        )
+        assert reports[0].conflicts == ()
