@@ -20,7 +20,9 @@ from pydantic import (
     field_validator,
 )
 from pydantic_core import PydanticCustomError
-from typing import Annotated
+from typing import Annotated, Literal
+
+from app.domain import EVENT_FAULT, EVENT_OK, EVENT_REPAIRED
 
 #: 秒级、仅 Z 结尾的 ISO 8601 UTC 时间（拒绝小数秒与偏移量）。
 _Z_SECONDS_RE = re.compile(
@@ -113,6 +115,34 @@ def _check_order(start: datetime, end: datetime) -> None:
         )
 
 
+def _normalize_runway_codes(values: list[str]) -> list[str]:
+    """跑道代码去空白、拒空白与重复（/evaluate 与巡检批次共用）。"""
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        if not isinstance(raw, str):
+            raise PydanticCustomError(
+                "bad_runway",
+                "跑道代码必须是字符串",
+            )
+        code = raw.strip()
+        if not code:
+            raise PydanticCustomError(
+                "blank_runway",
+                "跑道代码不能为空白",
+            )
+        if code in seen:
+            raise PydanticCustomError(
+                "duplicate_runway",
+                "跑道代码重复声明: {code}",
+                {"code": code},
+            )
+        seen.add(code)
+        normalized.append(code)
+    return normalized
+
+
 class WorkWindowIn(_StrictModel):
     """单段施工窗口入参。"""
 
@@ -196,29 +226,7 @@ class EvaluationRequest(_StrictModel):
     @field_validator("runways")
     @classmethod
     def _normalize_runways(cls, values: list[str]) -> list[str]:
-        normalized: list[str] = []
-        seen: set[str] = set()
-        for raw in values:
-            if not isinstance(raw, str):
-                raise PydanticCustomError(
-                    "bad_runway",
-                    "跑道代码必须是字符串",
-                )
-            code = raw.strip()
-            if not code:
-                raise PydanticCustomError(
-                    "blank_runway",
-                    "跑道代码不能为空白",
-                )
-            if code in seen:
-                raise PydanticCustomError(
-                    "duplicate_runway",
-                    "跑道代码重复声明: {code}",
-                    {"code": code},
-                )
-            seen.add(code)
-            normalized.append(code)
-        return normalized
+        return _normalize_runway_codes(values)
 
 
 class ConflictOut(_StrictModel):
@@ -236,3 +244,127 @@ class WorkWindowOut(_StrictModel):
     start: UtcZSecond
     end: UtcZSecond
     conflicts: list[ConflictOut]
+
+
+# ---------------------------------------------------------------------------
+# 跑道灯光巡检快照：POST /inspection-snapshot
+# ---------------------------------------------------------------------------
+
+#: 巡检事件结论取值，与领域层常量保持一致。
+EventKind = Literal[EVENT_OK, EVENT_FAULT, EVENT_REPAIRED]
+
+
+class InspectionPointIn(_StrictModel):
+    """一条跑道上应巡检的灯光点位。"""
+
+    runway: str = Field(..., min_length=1, description="已声明的跑道代码")
+    code: str = Field(..., min_length=1, description="点位标识，同一批次内跑道内唯一")
+
+    @field_validator("runway")
+    @classmethod
+    def _strip_runway(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise PydanticCustomError(
+                "blank_runway",
+                "跑道代码不能为空白",
+            )
+        return stripped
+
+    @field_validator("code")
+    @classmethod
+    def _strip_code(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise PydanticCustomError(
+                "blank_point_code",
+                "点位标识不能为空白",
+            )
+        return stripped
+
+
+class InspectionEventIn(_StrictModel):
+    """按发生时间记录的一条点位事件（正常 / 故障 / 已修复）。"""
+
+    runway: str = Field(..., min_length=1, description="已声明的跑道代码")
+    point: str = Field(..., min_length=1, description="本批次声明过的点位标识")
+    observed_at: UtcZSecond = Field(..., description="事件发生时间（严格 UTC 秒级）")
+    kind: EventKind
+
+    @field_validator("runway")
+    @classmethod
+    def _strip_runway(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise PydanticCustomError(
+                "blank_runway",
+                "跑道代码不能为空白",
+            )
+        return stripped
+
+    @field_validator("point")
+    @classmethod
+    def _strip_point(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise PydanticCustomError(
+                "blank_point_code",
+                "点位标识不能为空白",
+            )
+        return stripped
+
+
+class InspectionSnapshotRequest(_StrictModel):
+    """一次巡检快照请求：批次标识、截止时间、应查点位与已记录事件。
+
+    点位 / 事件对未声明跑道、未声明点位的引用关系属于跨字段约束，
+    由 :func:`app.main.inspection_reference_errors` 聚合为字段级 422；
+    同秒矛盾事件由领域层判定。
+    """
+
+    batch_id: str = Field(..., min_length=1, description="巡检批次标识")
+    cutoff: UtcZSecond = Field(..., description="批次截止时间，之后的记录不参与快照")
+    runways: list[str] = Field(
+        ...,
+        min_length=1,
+        description="本批次已声明的跑道代码集合，点位/事件引用的跑道必须在此声明",
+    )
+    points: list[InspectionPointIn] = Field(..., min_length=1)
+    events: list[InspectionEventIn] = Field(default_factory=list)
+
+    @field_validator("batch_id")
+    @classmethod
+    def _strip_batch_id(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise PydanticCustomError(
+                "blank_batch_id",
+                "巡检批次标识不能为空白",
+            )
+        return stripped
+
+    @field_validator("runways")
+    @classmethod
+    def _normalize_runways(cls, values: list[str]) -> list[str]:
+        return _normalize_runway_codes(values)
+
+
+class PointStatusOut(_StrictModel):
+    """单个点位折叠后的现状。"""
+
+    runway: str
+    point: str
+    status: Literal["normal", "fault", "unchecked"]
+    observed_at: UtcZSecond | None = Field(
+        ..., description="决定现状的最新事件时间；未检查点位为 null"
+    )
+
+
+class InspectionSnapshotOut(_StrictModel):
+    """巡检批次快照：点位现状及未检查 / 故障汇总数量。"""
+
+    batch_id: str
+    cutoff: UtcZSecond
+    points: list[PointStatusOut]
+    unchecked_count: int = Field(..., ge=0)
+    fault_count: int = Field(..., ge=0)

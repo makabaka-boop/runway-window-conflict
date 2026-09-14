@@ -374,3 +374,361 @@ class TestFieldLevelErrors:
             ("body", "work_windows", 0, "runway"),
             ("body", "work_windows", 1, "runway"),
         ]
+
+
+def _snapshot(payload: dict) -> tuple[int, object]:
+    resp = client.post("/inspection-snapshot", json=payload)
+    return resp.status_code, resp.json()
+
+
+class TestInspectionSnapshotEndpoint:
+    def _base(self, **overrides) -> dict:
+        payload = {
+            "batch_id": "NIGHT-20260914",
+            "cutoff": "2026-09-15T03:00:00Z",
+            "runways": ["36L", "18R"],
+            "points": [
+                {"runway": "36L", "code": "EDGE-A"},
+                {"runway": "36L", "code": "MID-B"},
+                {"runway": "18R", "code": "THR-C"},
+            ],
+            "events": [],
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_point_without_events_is_unchecked(self) -> None:
+        status, body = _snapshot(
+            self._base(
+                events=[
+                    {"runway": "36L", "point": "EDGE-A",
+                     "observed_at": "2026-09-15T02:00:00Z", "kind": "ok"},
+                ]
+            )
+        )
+        assert status == 200
+        assert body == {
+            "batch_id": "NIGHT-20260914",
+            "cutoff": "2026-09-15T03:00:00Z",
+            "points": [
+                {"runway": "36L", "point": "EDGE-A", "status": "normal",
+                 "observed_at": "2026-09-15T02:00:00Z"},
+                {"runway": "36L", "point": "MID-B", "status": "unchecked",
+                 "observed_at": None},
+                {"runway": "18R", "point": "THR-C", "status": "unchecked",
+                 "observed_at": None},
+            ],
+            "unchecked_count": 2,
+            "fault_count": 0,
+        }
+
+    def test_fault_then_repair_shows_normal(self) -> None:
+        status, body = _snapshot(
+            self._base(
+                events=[
+                    {"runway": "36L", "point": "EDGE-A",
+                     "observed_at": "2026-09-15T01:00:00Z", "kind": "fault"},
+                    {"runway": "36L", "point": "EDGE-A",
+                     "observed_at": "2026-09-15T02:30:00Z", "kind": "repaired"},
+                ]
+            )
+        )
+        assert status == 200
+        edge = body["points"][0]
+        assert edge["status"] == "normal"
+        assert edge["observed_at"] == "2026-09-15T02:30:00Z"
+        assert body["unchecked_count"] == 2
+        assert body["fault_count"] == 0
+
+    def test_repair_after_cutoff_point_still_faulty(self) -> None:
+        status, body = _snapshot(
+            self._base(
+                events=[
+                    {"runway": "36L", "point": "EDGE-A",
+                     "observed_at": "2026-09-15T02:00:00Z", "kind": "fault"},
+                    # 截止时间之后一秒的修复不参与快照
+                    {"runway": "36L", "point": "EDGE-A",
+                     "observed_at": "2026-09-15T03:00:01Z", "kind": "repaired"},
+                ]
+            )
+        )
+        assert status == 200
+        edge = body["points"][0]
+        assert edge["status"] == "fault"
+        assert edge["observed_at"] == "2026-09-15T02:00:00Z"
+        assert body["fault_count"] == 1
+        assert body["unchecked_count"] == 2
+
+    def test_event_exactly_at_cutoff_is_folded(self) -> None:
+        status, body = _snapshot(
+            self._base(
+                events=[
+                    {"runway": "36L", "point": "EDGE-A",
+                     "observed_at": "2026-09-15T02:00:00Z", "kind": "fault"},
+                    {"runway": "36L", "point": "EDGE-A",
+                     "observed_at": "2026-09-15T03:00:00Z", "kind": "repaired"},
+                ]
+            )
+        )
+        assert status == 200
+        assert body["points"][0]["status"] == "normal"
+        assert body["points"][0]["observed_at"] == "2026-09-15T03:00:00Z"
+
+    def test_contradictory_same_second_events_are_field_level_422_with_no_snapshot(
+        self,
+    ) -> None:
+        payload = self._base(
+            events=[
+                {"runway": "36L", "point": "EDGE-A",
+                 "observed_at": "2026-09-15T02:10:00Z", "kind": "fault"},
+                {"runway": "36L", "point": "EDGE-A",
+                 "observed_at": "2026-09-15T02:10:00Z", "kind": "ok"},
+            ]
+        )
+        status, body = _snapshot(payload)
+        assert status == 422
+        # 无部分快照：错误响应只含 detail
+        assert set(body.keys()) == {"detail"}
+        locs = {(tuple(e["loc"]), e["type"]) for e in body["detail"]}
+        assert (
+            ("body", "events", 0, "kind"),
+            "contradictory_events",
+        ) in locs
+        assert (
+            ("body", "events", 1, "kind"),
+            "contradictory_events",
+        ) in locs
+        # 错误信息能定位到跑道、点位与发生秒
+        msg = body["detail"][0]["msg"]
+        assert "EDGE-A" in msg and "2026-09-15T02:10:00Z" in msg
+
+    def test_contradiction_result_does_not_depend_on_input_order(self) -> None:
+        events_a = [
+            {"runway": "36L", "point": "EDGE-A",
+             "observed_at": "2026-09-15T02:10:00Z", "kind": "fault"},
+            {"runway": "36L", "point": "EDGE-A",
+             "observed_at": "2026-09-15T02:10:00Z", "kind": "ok"},
+        ]
+        status_a, body_a = _snapshot(self._base(events=events_a))
+        status_b, body_b = _snapshot(self._base(events=list(reversed(events_a))))
+        assert (status_a, status_b) == (422, 422)
+        locs_a = [tuple(e["loc"]) for e in body_a["detail"]]
+        locs_b = [tuple(e["loc"]) for e in body_b["detail"]]
+        # 错误始终按事件原始下标升序报告
+        assert locs_a == locs_b == [
+            ("body", "events", 0, "kind"),
+            ("body", "events", 1, "kind"),
+        ]
+
+    def test_result_does_not_depend_on_event_input_order(self) -> None:
+        events = [
+            {"runway": "36L", "point": "EDGE-A",
+             "observed_at": "2026-09-15T02:40:00Z", "kind": "fault"},
+            {"runway": "36L", "point": "EDGE-A",
+             "observed_at": "2026-09-15T02:10:00Z", "kind": "ok"},
+            {"runway": "36L", "point": "EDGE-A",
+             "observed_at": "2026-09-15T02:50:00Z", "kind": "repaired"},
+        ]
+        status_a, body_a = _snapshot(self._base(events=events))
+        status_b, body_b = _snapshot(self._base(events=list(reversed(events))))
+        assert (status_a, status_b) == (200, 200)
+        assert body_a == body_b
+        assert body_a["points"][0] == {
+            "runway": "36L", "point": "EDGE-A", "status": "normal",
+            "observed_at": "2026-09-15T02:50:00Z",
+        }
+
+    def test_same_kind_same_second_is_allowed(self) -> None:
+        status, body = _snapshot(
+            self._base(
+                events=[
+                    {"runway": "36L", "point": "EDGE-A",
+                     "observed_at": "2026-09-15T02:10:00Z", "kind": "fault"},
+                    {"runway": "36L", "point": "EDGE-A",
+                     "observed_at": "2026-09-15T02:10:00Z", "kind": "fault"},
+                ]
+            )
+        )
+        assert status == 200
+        assert body["points"][0]["status"] == "fault"
+        assert body["fault_count"] == 1
+
+    def test_points_follow_declared_order_and_runways_isolated(self) -> None:
+        status, body = _snapshot(
+            self._base(
+                events=[
+                    {"runway": "36L", "point": "MID-B",
+                     "observed_at": "2026-09-15T02:00:00Z", "kind": "fault"},
+                    # 18R 上相同点位代码与 36L 互不影响
+                    {"runway": "18R", "point": "MID-B",
+                     "observed_at": "2026-09-15T02:00:00Z", "kind": "ok"},
+                ]
+            )
+        )
+        assert status == 422
+        # 18R/MID-B 未声明为应查点位
+        locs = {tuple(e["loc"]) for e in body["detail"]}
+        assert ("body", "events", 1, "point") in locs
+
+        status, body = _snapshot(
+            self._base(
+                events=[
+                    {"runway": "36L", "point": "MID-B",
+                     "observed_at": "2026-09-15T02:00:00Z", "kind": "fault"},
+                    {"runway": "18R", "point": "THR-C",
+                     "observed_at": "2026-09-15T02:00:00Z", "kind": "ok"},
+                ]
+            )
+        )
+        assert status == 200
+        assert [p["point"] for p in body["points"]] == ["EDGE-A", "MID-B", "THR-C"]
+        assert [p["status"] for p in body["points"]] == [
+            "unchecked", "fault", "normal",
+        ]
+        assert body["unchecked_count"] == 1
+        assert body["fault_count"] == 1
+
+    def test_empty_events_marks_all_points_unchecked(self) -> None:
+        status, body = _snapshot(self._base())
+        assert status == 200
+        assert all(p["status"] == "unchecked" for p in body["points"])
+        assert body["unchecked_count"] == 3
+        assert body["fault_count"] == 0
+
+
+class TestInspectionSnapshotFieldErrors:
+    def _base(self) -> dict:
+        return {
+            "batch_id": "B1",
+            "cutoff": "2026-09-15T03:00:00Z",
+            "runways": ["36L"],
+            "points": [{"runway": "36L", "code": "P1"}],
+            "events": [],
+        }
+
+    def _locs_types(self, payload: dict) -> set[tuple]:
+        status, body = _snapshot(payload)
+        assert status == 422
+        return {(tuple(e["loc"]), e["type"]) for e in body["detail"]}
+
+    def test_unknown_runway_in_point(self) -> None:
+        payload = self._base()
+        payload["points"] = [{"runway": "18R", "code": "P1"}]
+        errors = self._locs_types(payload)
+        assert (("body", "points", 0, "runway"), "unknown_runway") in errors
+
+    def test_unknown_runway_in_event(self) -> None:
+        payload = self._base()
+        payload["events"] = [
+            {"runway": "18R", "point": "P1",
+             "observed_at": "2026-09-15T02:00:00Z", "kind": "ok"},
+        ]
+        errors = self._locs_types(payload)
+        assert (("body", "events", 0, "runway"), "unknown_runway") in errors
+
+    def test_undeclared_point_in_event_is_field_error(self) -> None:
+        payload = self._base()
+        payload["events"] = [
+            {"runway": "36L", "point": "GHOST",
+             "observed_at": "2026-09-15T02:00:00Z", "kind": "ok"},
+        ]
+        errors = self._locs_types(payload)
+        assert (
+            ("body", "events", 0, "point"),
+            "unknown_inspection_point",
+        ) in errors
+
+    def test_duplicate_point_declaration_rejected(self) -> None:
+        payload = self._base()
+        payload["points"] = [
+            {"runway": "36L", "code": "P1"},
+            {"runway": "36L", "code": "P1"},
+        ]
+        errors = self._locs_types(payload)
+        assert (
+            ("body", "points", 1, "code"),
+            "duplicate_inspection_point",
+        ) in errors
+
+    def test_invalid_event_kind_rejected(self) -> None:
+        payload = self._base()
+        payload["events"] = [
+            {"runway": "36L", "point": "P1",
+             "observed_at": "2026-09-15T02:00:00Z", "kind": "broken"},
+        ]
+        errors = self._locs_types(payload)
+        assert any(loc[-1] == "kind" for loc, _ in errors)
+
+    def test_strict_utc_seconds_enforced(self) -> None:
+        payload = self._base()
+        payload["cutoff"] = "2026-09-15T03:00:00"
+        payload["events"] = [
+            {"runway": "36L", "point": "P1",
+             "observed_at": "2026-09-15T02:00:00.5Z", "kind": "ok"},
+        ]
+        errors = self._locs_types(payload)
+        assert (("body", "cutoff"), "not_utc_z_seconds") in errors
+        assert (
+            ("body", "events", 0, "observed_at"),
+            "not_utc_z_seconds",
+        ) in errors
+
+    def test_blank_batch_id_rejected(self) -> None:
+        payload = self._base()
+        payload["batch_id"] = "   "
+        errors = self._locs_types(payload)
+        assert any(loc == ("body", "batch_id") for loc, _ in errors)
+
+    def test_points_required_and_nonempty(self) -> None:
+        payload = self._base()
+        del payload["points"]
+        errors = self._locs_types(payload)
+        assert any(loc == ("body", "points") for loc, _ in errors)
+
+        payload = self._base()
+        payload["points"] = []
+        errors = self._locs_types(payload)
+        assert any(loc == ("body", "points") for loc, _ in errors)
+
+    def test_extra_field_rejected(self) -> None:
+        payload = self._base()
+        payload["surprise"] = 1
+        errors = self._locs_types(payload)
+        assert (("body", "surprise"), "extra_forbidden") in errors
+
+    def test_runway_rules_shared_with_evaluate(self) -> None:
+        payload = self._base()
+        payload["runways"] = ["36L", "36L"]
+        errors = self._locs_types(payload)
+        types = {t for (_, t) in errors}
+        assert "duplicate_runway" in types
+
+    def test_malformed_json_and_non_object_body_are_422(self) -> None:
+        resp = client.post(
+            "/inspection-snapshot",
+            content=b"{not json",
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 422
+        assert tuple(resp.json()["detail"][0]["loc"]) == ("body",)
+
+        resp = client.post("/inspection-snapshot", json=[1, 2, 3])
+        assert resp.status_code == 422
+        assert ("body",) in {tuple(e["loc"]) for e in resp.json()["detail"]}
+
+    def test_unknown_runway_and_bad_time_aggregated_together(self) -> None:
+        payload = {
+            "batch_id": "B1",
+            "cutoff": "2026-09-15T03:00:00Z",
+            "runways": ["36L"],
+            "points": [{"runway": "18R", "code": "P1"}],
+            "events": [
+                {"runway": "36L", "point": "P1",
+                 "observed_at": "not-a-time", "kind": "ok"},
+            ],
+        }
+        status, body = _snapshot(payload)
+        assert status == 422
+        locs = {tuple(e["loc"]) for e in body["detail"]}
+        assert ("body", "points", 0, "runway") in locs
+        assert ("body", "events", 0, "observed_at") in locs

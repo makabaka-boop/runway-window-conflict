@@ -4,12 +4,24 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from app.domain import (
     Conflict,
+    EVENT_FAULT,
+    EVENT_OK,
+    EVENT_REPAIRED,
+    InspectionEvent,
+    InspectionPoint,
     Occupancy,
+    POINT_FAULT,
+    POINT_NORMAL,
+    POINT_UNCHECKED,
+    SnapshotContradictionError,
     WorkWindow,
     WorkWindowReport,
     buffered,
+    build_inspection_snapshot,
     evaluate,
     overlap,
 )
@@ -284,3 +296,202 @@ class TestYearBoundaries:
                        datetime(9999, 12, 31, 23, 59, 59, tzinfo=timezone.utc))],
         )
         assert reports[0].conflicts == ()
+
+
+class TestInspectionSnapshot:
+    """巡检事件折叠：截止过滤、最新事件取胜、同秒矛盾、顺序无关。"""
+
+    def _point(self, code: str, runway: str = "36L") -> InspectionPoint:
+        return InspectionPoint(runway, code)
+
+    def _event(
+        self,
+        code: str,
+        at: str,
+        kind: str,
+        runway: str = "36L",
+        index: int = -1,
+    ) -> InspectionEvent:
+        return InspectionEvent(runway, code, dt(at), kind, index)
+
+    def test_point_without_events_is_unchecked(self) -> None:
+        snapshot = build_inspection_snapshot(
+            "B1",
+            dt("2026-09-15T03:00:00"),
+            [self._point("P1"), self._point("P2")],
+            [self._event("P1", "2026-09-15T02:00:00", EVENT_OK)],
+        )
+        assert snapshot.points[0].status == POINT_NORMAL
+        assert snapshot.points[0].observed_at == dt("2026-09-15T02:00:00")
+        assert snapshot.points[1].status == POINT_UNCHECKED
+        assert snapshot.points[1].observed_at is None
+        assert snapshot.unchecked_count == 1
+        assert snapshot.fault_count == 0
+
+    def test_fault_followed_by_repair_is_normal(self) -> None:
+        snapshot = build_inspection_snapshot(
+            "B1",
+            dt("2026-09-15T03:00:00"),
+            [self._point("P1")],
+            [
+                self._event("P1", "2026-09-15T02:00:00", EVENT_FAULT),
+                self._event("P1", "2026-09-15T02:30:00", EVENT_REPAIRED),
+            ],
+        )
+        assert snapshot.points[0].status == POINT_NORMAL
+        assert snapshot.points[0].observed_at == dt("2026-09-15T02:30:00")
+        assert snapshot.fault_count == 0
+        assert snapshot.unchecked_count == 0
+
+    def test_repair_after_cutoff_does_not_count_fault_stays(self) -> None:
+        snapshot = build_inspection_snapshot(
+            "B1",
+            dt("2026-09-15T03:00:00"),
+            [self._point("P1")],
+            [
+                self._event("P1", "2026-09-15T02:00:00", EVENT_FAULT),
+                self._event("P1", "2026-09-15T03:00:01", EVENT_REPAIRED),
+            ],
+        )
+        assert snapshot.points[0].status == POINT_FAULT
+        assert snapshot.points[0].observed_at == dt("2026-09-15T02:00:00")
+        assert snapshot.fault_count == 1
+
+    def test_event_exactly_at_cutoff_is_included(self) -> None:
+        # 截止时间本身的记录参与快照（严格大于 cutoff 才丢弃）
+        snapshot = build_inspection_snapshot(
+            "B1",
+            dt("2026-09-15T03:00:00"),
+            [self._point("P1")],
+            [
+                self._event("P1", "2026-09-15T02:00:00", EVENT_FAULT),
+                self._event("P1", "2026-09-15T03:00:00", EVENT_REPAIRED),
+            ],
+        )
+        assert snapshot.points[0].status == POINT_NORMAL
+        assert snapshot.points[0].observed_at == dt("2026-09-15T03:00:00")
+
+    def test_contradictory_events_same_second_raise(self) -> None:
+        with pytest.raises(SnapshotContradictionError) as exc_info:
+            build_inspection_snapshot(
+                "B1",
+                dt("2026-09-15T03:00:00"),
+                [self._point("P1")],
+                [
+                    self._event("P1", "2026-09-15T02:00:00", EVENT_FAULT, index=0),
+                    self._event("P1", "2026-09-15T02:00:00", EVENT_OK, index=1),
+                ],
+            )
+        (contradiction,) = exc_info.value.contradictions
+        assert contradiction.runway == "36L"
+        assert contradiction.point == "P1"
+        assert contradiction.observed_at == dt("2026-09-15T02:00:00")
+        assert {e.kind for e in contradiction.events} == {EVENT_OK, EVENT_FAULT}
+        # 组内按结论类型稳定排序（ok 先于 fault），再按原始下标
+        assert [(e.kind, e.index) for e in contradiction.events] == [
+            (EVENT_OK, 1),
+            (EVENT_FAULT, 0),
+        ]
+
+    def test_same_kind_same_second_is_not_contradiction(self) -> None:
+        snapshot = build_inspection_snapshot(
+            "B1",
+            dt("2026-09-15T03:00:00"),
+            [self._point("P1")],
+            [
+                self._event("P1", "2026-09-15T02:00:00", EVENT_OK),
+                self._event("P1", "2026-09-15T02:00:00", EVENT_OK),
+            ],
+        )
+        assert snapshot.points[0].status == POINT_NORMAL
+
+    def test_contradiction_after_cutoff_is_ignored(self) -> None:
+        # 截止后的全部记录（含矛盾组）都不参与快照
+        snapshot = build_inspection_snapshot(
+            "B1",
+            dt("2026-09-15T03:00:00"),
+            [self._point("P1")],
+            [
+                self._event("P1", "2026-09-15T02:00:00", EVENT_FAULT),
+                self._event("P1", "2026-09-15T03:30:00", EVENT_FAULT),
+                self._event("P1", "2026-09-15T03:30:00", EVENT_OK),
+            ],
+        )
+        assert snapshot.points[0].status == POINT_FAULT
+
+    def test_event_input_order_does_not_affect_result(self) -> None:
+        events = [
+            self._event("P1", "2026-09-15T02:40:00", EVENT_FAULT),
+            self._event("P1", "2026-09-15T02:10:00", EVENT_OK),
+            self._event("P1", "2026-09-15T02:50:00", EVENT_REPAIRED),
+            self._event("P1", "2026-09-15T02:20:00", EVENT_FAULT),
+        ]
+        first = build_inspection_snapshot(
+            "B1", dt("2026-09-15T03:00:00"), [self._point("P1")], events
+        )
+        second = build_inspection_snapshot(
+            "B1", dt("2026-09-15T03:00:00"), [self._point("P1")], list(reversed(events))
+        )
+        assert first == second
+        assert first.points[0].status == POINT_NORMAL
+        assert first.points[0].observed_at == dt("2026-09-15T02:50:00")
+
+    def test_points_keep_declared_order_and_runways_isolated(self) -> None:
+        snapshot = build_inspection_snapshot(
+            "B1",
+            dt("2026-09-15T03:00:00"),
+            [
+                self._point("P2"),
+                self._point("P1"),
+                self._point("P9", runway="18R"),
+            ],
+            [
+                self._event("P1", "2026-09-15T02:00:00", EVENT_FAULT),
+                self._event("P9", "2026-09-15T02:00:00", EVENT_FAULT, runway="18R"),
+            ],
+        )
+        assert [(p.runway, p.point) for p in snapshot.points] == [
+            ("36L", "P2"),
+            ("36L", "P1"),
+            ("18R", "P9"),
+        ]
+        assert snapshot.points[0].status == POINT_UNCHECKED
+        assert snapshot.points[1].status == POINT_FAULT
+        # 36L 上的事件永不命中 18R 的同名点位，反之亦然
+        assert snapshot.points[2].status == POINT_FAULT
+        assert snapshot.fault_count == 2
+        assert snapshot.unchecked_count == 1
+
+    def test_contradiction_groups_sorted_stably(self) -> None:
+        with pytest.raises(SnapshotContradictionError) as exc_info:
+            build_inspection_snapshot(
+                "B1",
+                dt("2026-09-15T03:00:00"),
+                [self._point("P1"), self._point("P2")],
+                [
+                    self._event("P2", "2026-09-15T02:00:00", EVENT_OK, index=0),
+                    self._event("P2", "2026-09-15T02:00:00", EVENT_FAULT, index=1),
+                    self._event("P1", "2026-09-15T02:00:00", EVENT_REPAIRED, index=2),
+                    self._event("P1", "2026-09-15T02:00:00", EVENT_FAULT, index=3),
+                ],
+            )
+        groups = exc_info.value.contradictions
+        assert [(g.point, g.observed_at) for g in groups] == [
+            ("P1", dt("2026-09-15T02:00:00")),
+            ("P2", dt("2026-09-15T02:00:00")),
+        ]
+
+    def test_counts_and_batch_metadata_echoed(self) -> None:
+        snapshot = build_inspection_snapshot(
+            "NIGHT-20260914",
+            dt("2026-09-15T03:00:00"),
+            [self._point("P1"), self._point("P2"), self._point("P3")],
+            [
+                self._event("P1", "2026-09-15T02:00:00", EVENT_OK),
+                self._event("P2", "2026-09-15T02:00:00", EVENT_FAULT),
+            ],
+        )
+        assert snapshot.batch_id == "NIGHT-20260914"
+        assert snapshot.cutoff == dt("2026-09-15T03:00:00")
+        assert snapshot.fault_count == 1
+        assert snapshot.unchecked_count == 1

@@ -124,6 +124,150 @@ def main() -> int:
         "上界施工窗落在缓冲内：冲突",
     )
 
+    # 5) 巡检快照 —— 场景一：缺少事件的点位计为未检查
+    snap = {
+        "batch_id": "NIGHT-20260914",
+        "cutoff": "2026-09-15T03:00:00Z",
+        "runways": ["36L", "18R"],
+        "points": [
+            {"runway": "36L", "code": "EDGE-A"},
+            {"runway": "36L", "code": "MID-B"},
+            {"runway": "18R", "code": "THR-C"},
+        ],
+        "events": [
+            {"runway": "36L", "point": "EDGE-A",
+             "observed_at": "2026-09-15T02:00:00Z", "kind": "ok"},
+        ],
+    }
+    status, body = request("POST", "/inspection-snapshot", snap)
+    assert_equal(status, 200, "巡检快照场景一状态码")
+    assert_equal(body["batch_id"], "NIGHT-20260914", "批次标识回显")
+    assert_equal(body["cutoff"], "2026-09-15T03:00:00Z", "截止时间回显")
+    assert_equal(
+        [p["status"] for p in body["points"]],
+        ["normal", "unchecked", "unchecked"],
+        "缺少事件的点位计为未检查",
+    )
+    assert_equal(body["points"][1]["observed_at"], None, "未检查点位无事件时间")
+    assert_equal(body["unchecked_count"], 2, "未检查数量")
+    assert_equal(body["fault_count"], 0, "故障数量")
+
+    # 6) 巡检快照 —— 场景二：故障后修复显示正常
+    snap2 = {
+        "batch_id": "NIGHT-20260914",
+        "cutoff": "2026-09-15T03:00:00Z",
+        "runways": ["36L"],
+        "points": [{"runway": "36L", "code": "EDGE-A"}],
+        "events": [
+            # 故意乱序提交，验证结果与输入顺序无关
+            {"runway": "36L", "point": "EDGE-A",
+             "observed_at": "2026-09-15T02:30:00Z", "kind": "repaired"},
+            {"runway": "36L", "point": "EDGE-A",
+             "observed_at": "2026-09-15T02:00:00Z", "kind": "fault"},
+        ],
+    }
+    status, body = request("POST", "/inspection-snapshot", snap2)
+    assert_equal(status, 200, "巡检快照场景二状态码")
+    assert_equal(
+        body["points"][0],
+        {"runway": "36L", "point": "EDGE-A", "status": "normal",
+         "observed_at": "2026-09-15T02:30:00Z"},
+        "故障后修复显示正常",
+    )
+    assert_equal(body["fault_count"], 0, "修复后故障数量归零")
+    assert_equal(body["unchecked_count"], 0, "修复后无未检查点位")
+
+    # 7) 巡检快照 —— 场景三：截止后修复不参与快照，仍显示故障
+    snap3 = {
+        "batch_id": "NIGHT-20260914",
+        "cutoff": "2026-09-15T03:00:00Z",
+        "runways": ["36L"],
+        "points": [{"runway": "36L", "code": "EDGE-A"}],
+        "events": [
+            {"runway": "36L", "point": "EDGE-A",
+             "observed_at": "2026-09-15T02:00:00Z", "kind": "fault"},
+            {"runway": "36L", "point": "EDGE-A",
+             "observed_at": "2026-09-15T03:00:01Z", "kind": "repaired"},
+        ],
+    }
+    status, body = request("POST", "/inspection-snapshot", snap3)
+    assert_equal(status, 200, "巡检快照场景三状态码")
+    assert_equal(body["points"][0]["status"], "fault", "截止后修复仍显示故障")
+    assert_equal(
+        body["points"][0]["observed_at"],
+        "2026-09-15T02:00:00Z",
+        "现状时间取自截止前最后一条故障",
+    )
+    assert_equal(body["fault_count"], 1, "故障数量为 1")
+
+    # 截止时间当秒的记录必须参与（边界为严格大于）
+    snap3_ok = dict(snap3)
+    snap3_ok["events"] = [
+        {"runway": "36L", "point": "EDGE-A",
+         "observed_at": "2026-09-15T02:00:00Z", "kind": "fault"},
+        {"runway": "36L", "point": "EDGE-A",
+         "observed_at": "2026-09-15T03:00:00Z", "kind": "repaired"},
+    ]
+    status, body = request("POST", "/inspection-snapshot", snap3_ok)
+    assert_equal(status, 200, "截止当秒事件请求状态码")
+    assert_equal(body["points"][0]["status"], "normal", "截止当秒的修复生效")
+
+    # 8) 巡检快照 —— 场景四：同秒矛盾事件整体 422，字段级定位且无部分快照
+    snap4 = {
+        "batch_id": "NIGHT-20260914",
+        "cutoff": "2026-09-15T03:00:00Z",
+        "runways": ["36L"],
+        "points": [{"runway": "36L", "code": "EDGE-A"}],
+        "events": [
+            {"runway": "36L", "point": "EDGE-A",
+             "observed_at": "2026-09-15T02:10:00Z", "kind": "fault"},
+            {"runway": "36L", "point": "EDGE-A",
+             "observed_at": "2026-09-15T02:10:00Z", "kind": "ok"},
+        ],
+    }
+    status, body = request("POST", "/inspection-snapshot", snap4)
+    assert_equal(status, 422, "同秒矛盾事件必须 422")
+    assert_equal(set(body.keys()), {"detail"}, "矛盾时无部分快照字段")
+    locs = {tuple(e["loc"]) for e in body["detail"]}
+    assert (
+        "body", "events", 0, "kind"
+    ) in locs, f"矛盾错误须定位到事件，实际 loc: {locs}"
+    assert (
+        "body", "events", 1, "kind"
+    ) in locs, f"矛盾错误须定位到事件，实际 loc: {locs}"
+    assert all(
+        "EDGE-A" in e["msg"] and "2026-09-15T02:10:00Z" in e["msg"]
+        for e in body["detail"]
+    ), "错误信息须带出点位与发生秒"
+
+    # 事件倒序提交时，错误仍按事件原始下标稳定报告
+    snap4_rev = dict(snap4)
+    snap4_rev["events"] = list(reversed(snap4["events"]))
+    status, body_rev = request("POST", "/inspection-snapshot", snap4_rev)
+    assert_equal(status, 422, "乱序矛盾事件同样 422")
+    assert_equal(
+        [tuple(e["loc"]) for e in body_rev["detail"]],
+        [("body", "events", 0, "kind"), ("body", "events", 1, "kind")],
+        "错误次序与事件输入顺序无关",
+    )
+
+    # 引用未声明点位也是字段级 422（引用关系约束）
+    bad_ref = {
+        "batch_id": "B1",
+        "cutoff": "2026-09-15T03:00:00Z",
+        "runways": ["36L"],
+        "points": [{"runway": "36L", "code": "P1"}],
+        "events": [
+            {"runway": "36L", "point": "GHOST",
+             "observed_at": "2026-09-15T02:00:00Z", "kind": "ok"},
+        ],
+    }
+    status, body = request("POST", "/inspection-snapshot", bad_ref)
+    assert_equal(status, 422, "未声明点位引用必须 422")
+    assert (
+        "body", "events", 0, "point"
+    ) in {tuple(e["loc"]) for e in body["detail"]}, "未声明点位须定位到 point 字段"
+
     print("smoke_http: 全部断言通过")
     return 0
 

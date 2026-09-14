@@ -1,8 +1,13 @@
-# 夜间跑道施工放行评估 API
+# 夜间跑道施工放行评估 / 灯光巡检快照 API
 
-无状态纯后端服务：一次请求提交**已声明的跑道代码**、若干**施工窗口**与**航班占用区间**，
-服务逐施工窗口返回与之冲突的航班及交集起止。响应完全由请求体决定，可复算、顺序稳定，
-不依赖任何数据库或请求间状态。
+无状态纯后端服务：
+
+- 一次 **`POST /evaluate`** 请求提交**已声明的跑道代码**、若干**施工窗口**与**航班占用区间**，
+  服务逐施工窗口返回与之冲突的航班及交集起止；
+- 一次 **`POST /inspection-snapshot`** 请求提交**巡检批次**（应查点位 + 按发生时间记录的
+  正常 / 故障 / 已修复事件），服务按批次截止时间把事件折叠为各点位现状。
+
+响应完全由请求体决定，可复算、顺序稳定，不依赖任何数据库或请求间状态。
 
 - 语言/运行时：Python 3.12
 - Web 层：FastAPI + Uvicorn
@@ -101,6 +106,81 @@
 
 请求体非法时绝不返回任何窗口结论（无部分结果），多余字段也会被拒绝。
 
+## 跑道灯光巡检快照
+
+`POST /inspection-snapshot` 供夜班交接确认跑道灯光巡检是否留有未闭合缺陷：
+客户端提交巡检批次、每条跑道应查点位及按发生时间记录的 `ok`（正常）/
+`fault`（故障）/ `repaired`（已修复）事件，服务按批次**截止时间**折叠各点位的最新事件。
+
+折叠规则：
+
+1. **截止过滤**：`observed_at` 严格晚于 `cutoff` 的记录不参与快照
+   （截止当秒的记录参与；截止后的修复不能消除此前的故障）；
+2. **最新事件取胜**：同一点位（按 `runway` + `point` 区分）取截止前最后一条事件，
+   事件输入顺序不影响结果；`ok` 与 `repaired` 都折叠为现状 `normal`，
+   `fault` 折叠为 `fault`；
+3. **未检查**：截止前没有任何事件的点位现状为 `unchecked`，
+   `observed_at` 为 `null`；
+4. **同秒矛盾**：同一点位同一秒出现不同结论（如同时记录 `fault` 与 `ok`）
+   时整次请求返回 HTTP 422，错误定位到每一条矛盾事件的 `events[i].kind`，
+   不返回任何部分快照；同一秒结论相同不算矛盾；
+5. **引用关系**：点位与事件引用的跑道必须在 `runways` 中声明，
+   事件引用的点位必须在本批次 `points` 中声明（同跑道内匹配，跨跑道同名点位互不影响），
+   同跑道内点位不可重复声明；
+6. 结果中 `points` 严格按请求中的声明顺序返回，并汇总 `unchecked_count`、
+   `fault_count`；时间沿用严格的带 `Z` UTC 秒级格式。
+
+请求示例：
+
+```json
+{
+  "batch_id": "NIGHT-20260914",
+  "cutoff": "2026-09-15T03:00:00Z",
+  "runways": ["36L", "18R"],
+  "points": [
+    {"runway": "36L", "code": "EDGE-A"},
+    {"runway": "36L", "code": "MID-B"},
+    {"runway": "18R", "code": "THR-C"}
+  ],
+  "events": [
+    {"runway": "36L", "point": "EDGE-A", "observed_at": "2026-09-15T02:00:00Z", "kind": "fault"},
+    {"runway": "36L", "point": "EDGE-A", "observed_at": "2026-09-15T02:30:00Z", "kind": "repaired"},
+    {"runway": "36L", "point": "MID-B", "observed_at": "2026-09-15T02:40:00Z", "kind": "fault"},
+    {"runway": "18R", "point": "THR-C", "observed_at": "2026-09-15T03:05:00Z", "kind": "repaired"}
+  ]
+}
+```
+
+响应（`200 OK`）：EDGE-A 故障后修复为正常；MID-B 仍故障；
+THR-C 的修复发生在截止之后、不参与快照，计为未检查。
+
+```json
+{
+  "batch_id": "NIGHT-20260914",
+  "cutoff": "2026-09-15T03:00:00Z",
+  "points": [
+    {"runway": "36L", "point": "EDGE-A", "status": "normal", "observed_at": "2026-09-15T02:30:00Z"},
+    {"runway": "36L", "point": "MID-B", "status": "fault", "observed_at": "2026-09-15T02:40:00Z"},
+    {"runway": "18R", "point": "THR-C", "status": "unchecked", "observed_at": null}
+  ],
+  "unchecked_count": 1,
+  "fault_count": 1
+}
+```
+
+同秒矛盾事件返回字段级 422（无部分快照，错误次序与事件输入顺序无关）：
+
+```json
+{
+  "detail": [
+    {"type": "contradictory_events", "loc": ["body", "events", 0, "kind"],
+     "msg": "同一点位同一时刻的事件结论矛盾：跑道 36L 点位 EDGE-A 2026-09-15T02:10:00Z 同时出现 ok、fault",
+     "input": "fault", "ctx": {"runway": "36L", "point": "EDGE-A", "observed_at": "2026-09-15T02:10:00Z"}},
+    {"type": "contradictory_events", "loc": ["body", "events", 1, "kind"], "...": "..."}
+  ]
+}
+```
+
 ## 运行
 
 仅启动 API（容器内监听 8000，默认宿主端口 8000）：
@@ -114,6 +194,7 @@ API_PORT=18080 docker compose up --build
 - 健康检查：`GET http://localhost:8000/health` → `{"status": "ok"}`
 - 交互式文档：`http://localhost:8000/docs`
 - 评估接口：`POST http://localhost:8000/evaluate`
+- 巡检快照接口：`POST http://localhost:8000/inspection-snapshot`
 
 ### 一次性验收服务 verify
 
@@ -126,7 +207,8 @@ docker compose run --rm verify
 它会：
 
 1. 等待 `api` 健康检查通过；
-2. 在容器内执行全部 pytest（临界相接、侵入一秒、跨日区间、跑道隔离、排序稳定性、各类 422）；
+2. 在容器内执行全部 pytest（临界相接、侵入一秒、跨日区间、跑道隔离、排序稳定性、各类 422，
+   以及巡检快照四组确定性场景：未检查 / 故障后修复 / 截止后修复仍故障 / 同秒矛盾 422）；
 3. 对运行中的 API 执行 `scripts/smoke_http.py`（零第三方依赖，断言真实 HTTP 响应）。
 
 ### 本地直接运行（不用 Docker）
@@ -145,9 +227,9 @@ API_BASE_URL=http://127.0.0.1:8000 python scripts/smoke_http.py
 
 ```
 app/
-  domain.py     # 纯领域逻辑：十分钟扩展、半开相交、排序（无第三方依赖）
+  domain.py     # 纯领域逻辑：十分钟扩展、半开相交、排序、巡检事件折叠（无第三方依赖）
   schemas.py    # Pydantic 请求/响应模型、Z 秒级时间与字段级约束
-  main.py       # FastAPI 装配、422 错误聚合、无状态 /evaluate
+  main.py       # FastAPI 装配、422 错误聚合、无状态 /evaluate 与 /inspection-snapshot
 tests/
   test_domain.py
   test_api.py
