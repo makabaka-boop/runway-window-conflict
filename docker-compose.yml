@@ -1,0 +1,31 @@
+# 默认只启动 API 服务：
+#   docker compose up --build
+# 宿主端口可用环境变量覆盖：
+#   API_PORT=18080 docker compose up --build
+#
+# 一次性验收服务（不随默认配置启动，跑完即退出）：
+#   docker compose run --rm verify
+
+services:
+  api:
+    build: .
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  verify:
+    build: .
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      API_BASE_URL: http://api:8000
+    entrypoint: ["sh", "-c"]
+    command:
+      - "pytest -q && python scripts/smoke_http.py"
+    profiles: ["verify"]
