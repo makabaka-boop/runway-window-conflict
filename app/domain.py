@@ -22,6 +22,8 @@
 除冰液配给规则：
 
 - 失效时间小于等于计算时刻的批次已失效，不参与扣减，单独列入过期批次；
+- 入库时间晚于失效时间（含相等）的批次时段非法，入库时间严格晚于
+  计算时刻的批次尚未入库，两者都在整次配给前拒绝，不产生部分配给；
 - 有效批次按（失效时间、入库时间、批次编号）稳定排序，先到先用，
   结果与库存输入顺序无关；
 - 需求按给定的优先级顺序逐笔扣减，每项需求可拆分到多个批次；
@@ -475,6 +477,27 @@ class InsufficientInventoryError(ValueError):
         )
 
 
+class BatchNotReceivedError(ValueError):
+    """批次在计算时刻尚未入库，整次配给必须在扣减前拒绝。
+
+    入库时间严格晚于计算时刻的库存属于未来库存，不得分配给当前作业；
+    入库时间恰等于计算时刻视为已入库，可正常参与配给。
+    """
+
+    def __init__(self, batch_id: str, calculated_at: datetime) -> None:
+        self.batch_id = batch_id
+        self.calculated_at = calculated_at
+        super().__init__(f"批次 {batch_id} 在计算时刻尚未入库")
+
+
+class InvalidBatchPeriodError(ValueError):
+    """批次入库时间不严格早于失效时间，合法库存时段为空，整次配给拒绝。"""
+
+    def __init__(self, batch_id: str) -> None:
+        self.batch_id = batch_id
+        super().__init__(f"批次 {batch_id} 的入库时间必须严格早于失效时间")
+
+
 def _deicing_batch_key(batch: DeicingBatch) -> tuple:
     """批次扣减顺序：失效时间、入库时间、批次编号。
 
@@ -496,15 +519,19 @@ def allocate_deicing(
 
     1. 批次编号、作业编号任一重复即整次失败
        （:class:`DuplicateIdentifierError`）；
-    2. 失效时间小于等于 ``calculated_at`` 的批次已失效，不参与扣减，
+    2. 任一库存时段非法（入库时间不严格早于失效时间）即整次失败
+       （:class:`InvalidBatchPeriodError`），先拒绝非法批次本身；
+    3. 任一批次入库时间严格晚于 ``calculated_at``（尚未入库）即整次失败
+       （:class:`BatchNotReceivedError`），未来库存不得分配给当前作业；
+    4. 失效时间小于等于 ``calculated_at`` 的批次已失效，不参与扣减，
        原样列入 ``expired_batches``；
-    3. 有效批次按（失效时间、入库时间、批次编号）稳定排序——
+    5. 有效批次按（失效时间、入库时间、批次编号）稳定排序——
        库存输入顺序不影响结果；
-    4. 有效库存总量小于总需求时整次失败
+    6. 有效库存总量小于总需求时整次失败
        （:class:`InsufficientInventoryError`），不返回部分配给；
-    5. 需求按给定的优先级顺序逐笔扣减，每项需求可拆分到多个批次，
-       扣减顺序即第 3 步的批次顺序；
-    6. 数量以 ``Decimal`` 精确运算；调用方负责三位小数约束
+    7. 需求按给定的优先级顺序逐笔扣减，每项需求可拆分到多个批次，
+       扣减顺序即第 5 步的批次顺序；
+    8. 数量以 ``Decimal`` 精确运算；调用方负责三位小数约束
        （API 层强制），因此全部结果同样精确到三位小数。
 
     本函数是纯函数：相同输入永远得到相同、顺序稳定的输出。
@@ -520,6 +547,16 @@ def allocate_deicing(
         if demand.job_id in seen_jobs:
             raise DuplicateIdentifierError("job", demand.job_id)
         seen_jobs.add(demand.job_id)
+
+    # 非法时段与“尚未入库”都必须在任何扣减发生之前拒绝，使结果与
+    # 库存输入顺序无关；按编号稳定遍历，先判定批次自身的时段合法性，
+    # 再判定相对计算时刻的入库状态（入库恰等于计算时刻视为已入库）。
+    for batch in sorted(batches, key=lambda b: b.batch_id):
+        if not batch.received_at < batch.expires_at:
+            raise InvalidBatchPeriodError(batch.batch_id)
+    for batch in sorted(batches, key=lambda b: b.batch_id):
+        if batch.received_at > calculated_at:
+            raise BatchNotReceivedError(batch.batch_id, calculated_at)
 
     with localcontext() as context:
         context.prec = _DOMAIN_DECIMAL_PRECISION

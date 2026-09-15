@@ -9,12 +9,14 @@ import pytest
 
 from app.domain import (
     AllocationLine,
+    BatchNotReceivedError,
     BatchRemaining,
     DeicingBatch,
     DeicingDemand,
     DuplicateIdentifierError,
     ExpiredBatch,
     InsufficientInventoryError,
+    InvalidBatchPeriodError,
     allocate_deicing,
 )
 
@@ -216,6 +218,108 @@ class TestInsufficientInventory:
             [demand("JOB-1", "70")],
         )
         assert all(r.remaining == q("0") for r in report.remaining)
+
+
+class TestBatchLifecycle:
+    """库存批次生命周期：计算时刻尚未入库、入库/失效时段非法都必须整次拒绝。"""
+
+    def test_batch_received_after_calculated_at_is_rejected(self) -> None:
+        # 计算时刻 02:00，批次 03:00 才入库：未来库存不得分给当前作业
+        with pytest.raises(BatchNotReceivedError) as exc_info:
+            allocate_deicing(
+                dt(CALC),
+                [batch("FUTURE-1", "100", "2026-09-15T03:00:00", "2026-09-17T08:00:00")],
+                [demand("JOB-1", "50")],
+            )
+        assert exc_info.value.batch_id == "FUTURE-1"
+        assert exc_info.value.calculated_at == dt(CALC)
+
+    def test_batch_received_one_second_after_calculated_at_is_rejected(self) -> None:
+        with pytest.raises(BatchNotReceivedError):
+            allocate_deicing(
+                dt(CALC),
+                [batch("FUTURE-1", "100", "2026-09-15T02:00:01", "2026-09-17T08:00:00")],
+                [demand("JOB-1", "1")],
+            )
+
+    def test_batch_received_exactly_at_calculated_at_is_available(self) -> None:
+        # 入库恰等于计算时刻：视为已入库，可参与配给
+        report = allocate_deicing(
+            dt(CALC),
+            [batch("B1", "10", CALC, "2026-09-17T08:00:00")],
+            [demand("JOB-1", "4")],
+        )
+        assert report.allocations[0].lines == (AllocationLine("B1", q("4")),)
+        assert report.remaining == (BatchRemaining("B1", q("6")),)
+
+    def test_future_batch_does_not_count_toward_effective_inventory(self) -> None:
+        # 未来批次的 100 既不能配给，也不能“凑数”让缺货检查通过后产生空明细
+        with pytest.raises(BatchNotReceivedError):
+            allocate_deicing(
+                dt(CALC),
+                [
+                    batch("FUTURE-1", "100", "2026-09-15T03:00:00", "2026-09-17T08:00:00"),
+                    batch("DZ-01", "5", "2026-09-14T20:00:00", "2026-09-16T08:00:00"),
+                ],
+                [demand("JOB-1", "10")],
+            )
+
+    def test_future_batch_is_rejected_before_any_partial_allocation(self) -> None:
+        # 即使只有空需求，未来批次同样整次拒绝而非原样出现在结果中
+        with pytest.raises(BatchNotReceivedError):
+            allocate_deicing(
+                dt(CALC),
+                [batch("FUTURE-1", "100", "2026-09-15T03:00:00", "2026-09-17T08:00:00")],
+                [],
+            )
+
+    def test_received_after_expires_is_rejected(self) -> None:
+        # 入库时间晚于失效时间：合法库存时段为空
+        with pytest.raises(InvalidBatchPeriodError) as exc_info:
+            allocate_deicing(
+                dt(CALC),
+                [batch("BAD-1", "100", "2026-09-17T08:00:00", "2026-09-15T08:00:00")],
+                [demand("JOB-1", "50")],
+            )
+        assert exc_info.value.batch_id == "BAD-1"
+
+    def test_received_equal_to_expires_is_rejected(self) -> None:
+        # 入库等于失效：零长时段同样非法（必须严格早于）
+        with pytest.raises(InvalidBatchPeriodError):
+            allocate_deicing(
+                dt(CALC),
+                [batch("ZERO-1", "100", "2026-09-16T08:00:00", "2026-09-16T08:00:00")],
+                [demand("JOB-1", "50")],
+            )
+
+    def test_invalid_period_is_rejected_before_lifecycle_and_shortage(self) -> None:
+        # 同时倒挂且尚未入库、且库存不足时，先报非法时段
+        with pytest.raises(InvalidBatchPeriodError):
+            allocate_deicing(
+                dt(CALC),
+                [batch("BAD-1", "1", "2026-09-17T08:00:00", "2026-09-16T08:00:00")],
+                [demand("JOB-1", "50")],
+            )
+
+    def test_lifecycle_check_is_independent_of_batch_input_order(self) -> None:
+        # 拒绝结论与库存输入顺序无关（按批次编号稳定判定）
+        good = batch("DZ-01", "10", "2026-09-14T20:00:00", "2026-09-16T08:00:00")
+        future = batch("FUTURE-1", "10", "2026-09-15T03:00:00", "2026-09-17T08:00:00")
+        for ordering in ([good, future], [future, good]):
+            with pytest.raises(BatchNotReceivedError) as exc_info:
+                allocate_deicing(dt(CALC), ordering, [demand("JOB-1", "5")])
+            assert exc_info.value.batch_id == "FUTURE-1"
+
+    def test_expired_batch_that_was_received_long_ago_still_works(self) -> None:
+        # 回归：早已入库、在计算时刻失效的批次仍按过期批次处理
+        report = allocate_deicing(
+            dt(CALC),
+            [batch("OLD-1", "50", "2026-09-13T08:00:00", CALC)],
+            [],
+        )
+        assert report.expired_batches == (
+            ExpiredBatch("OLD-1", q("50"), dt("2026-09-13T08:00:00"), dt(CALC)),
+        )
 
 
 class TestDuplicateIdentifiers:

@@ -28,6 +28,7 @@ from app.domain import (
     EVENT_KINDS,
     MIN_READINGS_PER_SEGMENT,
     SEGMENTS,
+    BatchNotReceivedError,
     DeicingBatch,
     DeicingDemand,
     DuplicateIdentifierError,
@@ -38,6 +39,7 @@ from app.domain import (
     InspectionPoint,
     InsufficientInventoryError,
     InsufficientReadingsError,
+    InvalidBatchPeriodError,
     Occupancy,
     SegmentReadings,
     SnapshotContradictionError,
@@ -63,6 +65,7 @@ from app.schemas import (
     PointStatusOut,
     SegmentMedianOut,
     WorkWindowOut,
+    _Z_SECONDS_RE,
     serialize_utc_z_seconds,
 )
 
@@ -70,7 +73,7 @@ T = TypeVar("T", bound=BaseModel)
 
 app = FastAPI(
     title="夜间跑道施工放行 / 灯光巡检 / 除冰液配给 / 摩擦评定 API",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "纯后端、无状态：航班占用两端各扩展十分钟后按半开区间判定冲突；"
         "巡检批次按截止时间把事件折叠为点位现状；"
@@ -381,6 +384,84 @@ def _deicing_duplicate_errors(payload: object) -> list[dict]:
                 )
             else:
                 seen[identifier] = index
+    return errors
+
+
+def _deicing_lifecycle_errors(payload: object) -> list[dict]:
+    """除冰液批次生命周期约束：计算时刻尚未入库的批次必须整次拒绝。
+
+    入库时间严格晚于计算时刻的库存属于未来库存，不能分配给当前作业
+    （入库恰等于计算时刻视为已入库）。批次自身的入库/失效时段倒挂
+    由模型字段校验器（``start_not_before_end``，定位到 ``expires_at``）
+    负责；这里只补充需要同时读取 ``calculated_at`` 与各批次的跨对象
+    约束，因此与其它字段级错误一起聚合返回，不产生任何部分配给。
+    形态不合法（时间非严格 Z 秒级字符串、批次非对象等）时跳过，
+    让位给 Pydantic 的字段级错误。
+    """
+
+    if not isinstance(payload, dict):
+        return []
+
+    raw_calculated_at = payload.get("calculated_at")
+    if not isinstance(raw_calculated_at, str) or not _Z_SECONDS_RE.match(
+        raw_calculated_at
+    ):
+        return []
+
+    raw_batches = payload.get("batches")
+    if not isinstance(raw_batches, list):
+        return []
+
+    errors: list[dict] = []
+    for index, item in enumerate(raw_batches):
+        if not isinstance(item, dict):
+            continue
+        raw_received_at = item.get("received_at")
+        if not isinstance(raw_received_at, str) or not _Z_SECONDS_RE.match(
+            raw_received_at
+        ):
+            continue
+        raw_expires_at = item.get("expires_at")
+        if isinstance(raw_expires_at, str) and _Z_SECONDS_RE.match(raw_expires_at):
+            # 入库不严格早于失效的非法时段已由字段校验器定位到
+            # expires_at 报告，按“先拒绝批次自身非法时段”的次序
+            # 不再叠加相对计算时刻的入库状态错误。
+            if raw_received_at >= raw_expires_at:
+                continue
+        # 固定宽度的 Z 秒级时间戳按字符串字典序与时间先后完全一致，
+        # 无需解析即可安全比较；非法日历时间已被模型层拒绝。
+        if raw_received_at > raw_calculated_at:
+            raw_batch_id = item.get("batch_id")
+            identifier = (
+                raw_batch_id.strip()
+                if isinstance(raw_batch_id, str) and raw_batch_id.strip()
+                else raw_batch_id
+            )
+            errors.append(
+                {
+                    "type": "batch_not_received",
+                    "loc": ("body", "batches", index, "received_at"),
+                    "msg": (
+                        f"批次 {identifier!r} 在计算时刻 "
+                        f"{raw_calculated_at} 尚未入库（入库时间 "
+                        f"{raw_received_at}），未来库存不得参与本次配给"
+                    ),
+                    "input": raw_received_at,
+                    "ctx": {
+                        "batch_id": identifier,
+                        "received_at": raw_received_at,
+                        "calculated_at": raw_calculated_at,
+                    },
+                }
+            )
+    return errors
+
+
+def _deicing_validation_errors(payload: object) -> list[dict]:
+    """除冰液配给的全部跨条目 / 跨对象原始结构校验。"""
+
+    errors = _deicing_duplicate_errors(payload)
+    errors.extend(_deicing_lifecycle_errors(payload))
     return errors
 
 
@@ -768,14 +849,15 @@ async def deicing_allocation(request: Request) -> DeicingAllocationOut:
     """按计算时刻配给除冰液：过期批次剔除，有效批次先到期先用。
 
     请求体的小数按 ``Decimal`` 精确解析，数量统一按三位小数计算；
-    任一编号重复、时间格式非法、数量非正或总可用量不足时整次 422，
+    任一编号重复、时间格式非法、批次入库晚于失效（时段非法）、
+    批次在计算时刻尚未入库、数量非正或总可用量不足时整次 422，
     不返回部分配给；库存输入顺序不影响结果。
     """
 
     req = _validate_payload(
         await _parse_body(request, parse_float=Decimal),
         DeicingAllocationRequest,
-        _deicing_duplicate_errors,
+        _deicing_validation_errors,
     )
 
     batches = [
@@ -796,6 +878,18 @@ async def deicing_allocation(request: Request) -> DeicingAllocationOut:
         report = allocate_deicing(req.calculated_at, batches, demands)
     except InsufficientInventoryError as exc:
         raise RequestValidationError(_insufficient_inventory_errors(exc))
+    except (BatchNotReceivedError, InvalidBatchPeriodError) as exc:
+        # 原始结构检查 / 字段校验器已先行拒绝全部同类问题，此处仅为兜底。
+        raise RequestValidationError(
+            [
+                {
+                    "type": "invalid_deicing_batch",
+                    "loc": ("body",),
+                    "msg": str(exc),
+                    "input": None,
+                }
+            ]
+        )
     except DuplicateIdentifierError as exc:
         # 原始结构检查已先行拒绝全部重复编号，此处仅为兜底，正常不可达。
         raise RequestValidationError(

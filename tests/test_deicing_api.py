@@ -175,6 +175,212 @@ class TestDeicingAllocationScenarios:
         assert body["detail"][0]["ctx"]["effective_inventory"] == 0
 
 
+class TestDeicingBatchLifecycle:
+    """库存批次生命周期：尚未入库与时段非法的批次必须整次拒绝。"""
+
+    def test_batch_received_after_calculated_at_is_rejected(self) -> None:
+        status, body = _allocate(
+            _base(
+                batches=[
+                    _batch("FUTURE-1", 100, "2026-09-15T03:00:00Z", "2026-09-17T08:00:00Z")
+                ],
+                demands=[{"job_id": "JOB-1", "requested": 50}],
+            )
+        )
+        assert status == 422
+        assert set(body.keys()) == {"detail"}  # 无部分配给
+        (error,) = body["detail"]
+        assert error["type"] == "batch_not_received"
+        assert error["loc"] == ["body", "batches", 0, "received_at"]
+        assert error["input"] == "2026-09-15T03:00:00Z"
+        assert error["ctx"] == {
+            "batch_id": "FUTURE-1",
+            "received_at": "2026-09-15T03:00:00Z",
+            "calculated_at": CALC,
+        }
+        assert "FUTURE-1" in error["msg"]
+
+    def test_batch_received_one_second_after_calculated_at_is_rejected(self) -> None:
+        errors = _loc_types(
+            _base(
+                batches=[
+                    _batch("FUTURE-1", 100, "2026-09-15T02:00:01Z", "2026-09-17T08:00:00Z")
+                ]
+            )
+        )
+        assert (
+            ("body", "batches", 0, "received_at"),
+            "batch_not_received",
+        ) in errors
+
+    def test_batch_received_exactly_at_calculated_at_is_allocated(self) -> None:
+        status, body = _allocate(
+            _base(
+                batches=[_batch("B1", 10, CALC, "2026-09-17T08:00:00Z")],
+                demands=[{"job_id": "JOB-1", "requested": 4}],
+            )
+        )
+        assert status == 200
+        assert body["allocations"][0]["lines"] == [{"batch_id": "B1", "quantity": 4}]
+
+    def test_multiple_future_batches_are_all_reported(self) -> None:
+        status, body = _allocate(
+            _base(
+                batches=[
+                    _batch("FUTURE-1", 10, "2026-09-15T05:00:00Z", "2026-09-17T08:00:00Z"),
+                    _batch("FUTURE-2", 10, "2026-09-15T04:00:00Z", "2026-09-16T08:00:00Z"),
+                ],
+                demands=[{"job_id": "JOB-1", "requested": 5}],
+            )
+        )
+        assert status == 422
+        assert {
+            tuple(e["loc"]) for e in body["detail"] if e["type"] == "batch_not_received"
+        } == {
+            ("body", "batches", 0, "received_at"),
+            ("body", "batches", 1, "received_at"),
+        }
+
+    def test_future_batch_error_aggregates_with_other_errors(self) -> None:
+        errors = _loc_types(
+            _base(
+                batches=[
+                    # 尚未入库
+                    _batch("FUTURE-1", 10, "2026-09-15T03:00:00Z", "2026-09-17T08:00:00Z"),
+                    # 数量非正
+                    _batch("DZ-01", 0),
+                ],
+                demands=[
+                    {"job_id": "JOB-1", "requested": 1},
+                    {"job_id": "JOB-1", "requested": 2},  # 作业编号重复
+                ],
+            )
+        )
+        assert (("body", "batches", 0, "received_at"), "batch_not_received") in errors
+        assert (("body", "batches", 1, "available"), "quantity_not_positive") in errors
+        assert (("body", "demands", 1, "job_id"), "duplicate_job_id") in errors
+
+    def test_received_after_expires_is_rejected(self) -> None:
+        errors = _loc_types(
+            _base(
+                batches=[
+                    _batch("BAD-1", 100, "2026-09-17T08:00:00Z", "2026-09-15T08:00:00Z")
+                ],
+                demands=[{"job_id": "JOB-1", "requested": 50}],
+            )
+        )
+        # 倒挂时段定位到 expires_at，与施工窗口的倒挂区间同一错误类型
+        assert (("body", "batches", 0, "expires_at"), "start_not_before_end") in errors
+
+    def test_received_equal_to_expires_is_rejected(self) -> None:
+        errors = _loc_types(
+            _base(
+                batches=[
+                    _batch("ZERO-1", 100, "2026-09-16T08:00:00Z", "2026-09-16T08:00:00Z")
+                ]
+            )
+        )
+        assert (("body", "batches", 0, "expires_at"), "start_not_before_end") in errors
+
+    def test_inverted_period_does_not_also_report_not_received(self) -> None:
+        # 倒挂批次（必然也晚于计算时刻）只报时段非法一个根因
+        status, body = _allocate(
+            _base(
+                batches=[
+                    _batch("BAD-1", 100, "2026-09-17T08:00:00Z", "2026-09-15T08:00:00Z")
+                ]
+            )
+        )
+        assert status == 422
+        assert {(tuple(e["loc"]), e["type"]) for e in body["detail"]} == {
+            (("body", "batches", 0, "expires_at"), "start_not_before_end")
+        }
+
+    def test_valid_period_received_before_expires_still_passes(self) -> None:
+        # 失效时间仅比计算时刻晚一秒：时段合法且仍有效，一秒余量也必须可配给
+        status, body = _allocate(
+            _base(
+                batches=[_batch("DZ-01", 10, "2026-09-14T20:00:00Z", "2026-09-15T02:00:01Z")],
+                demands=[{"job_id": "JOB-1", "requested": 3}],
+            )
+        )
+        assert status == 200, body
+        assert body["allocations"][0]["lines"] == [{"batch_id": "DZ-01", "quantity": 3}]
+
+    def test_malformed_calculated_at_yields_only_time_error(self) -> None:
+        # 计算时刻形态非法时由模型报错，生命周期检查不越位产生噪音
+        errors = _loc_types(
+            _base(
+                calculated_at="not-a-time",
+                batches=[
+                    _batch("FUTURE-1", 10, "2026-09-15T03:00:00Z", "2026-09-17T08:00:00Z")
+                ],
+            )
+        )
+        assert (("body", "calculated_at"), "not_utc_z_seconds") in errors
+        assert not any(t == "batch_not_received" for _, t in errors)
+
+
+class TestDeicingRequiredLists:
+    """计算时刻之外，库存清单与需求清单都是必要清单。"""
+
+    def test_missing_both_lists_points_to_both_fields(self) -> None:
+        status, body = _allocate({"calculated_at": CALC})
+        assert status == 422
+        errors = {(tuple(e["loc"]), e["type"]) for e in body["detail"]}
+        assert (("body", "batches"), "missing") in errors
+        assert (("body", "demands"), "missing") in errors
+
+    def test_missing_batches_is_rejected_even_with_demands(self) -> None:
+        status, body = _allocate(
+            {"calculated_at": CALC, "demands": [{"job_id": "JOB-1", "requested": 1}]}
+        )
+        assert status == 422
+        assert {(tuple(e["loc"]), e["type"]) for e in body["detail"]} == {
+            (("body", "batches"), "missing")
+        }
+
+    def test_missing_demands_is_rejected_even_with_batches(self) -> None:
+        status, body = _allocate(
+            {"calculated_at": CALC, "batches": [_batch("DZ-01", 10)]}
+        )
+        assert status == 422
+        assert {(tuple(e["loc"]), e["type"]) for e in body["detail"]} == {
+            (("body", "demands"), "missing")
+        }
+
+    def test_explicit_empty_lists_still_succeed(self) -> None:
+        # 缺键不行，但显式空清单仍是合法的“无库存、无需求”配给
+        status, body = _allocate({"calculated_at": CALC, "batches": [], "demands": []})
+        assert status == 200
+        assert body == {
+            "calculated_at": CALC,
+            "allocations": [],
+            "remaining": [],
+            "expired_batches": [],
+        }
+
+    def test_explicit_empty_batches_with_demand_is_insufficient(self) -> None:
+        # 显式空库存 + 正需求：走到缺货整次失败而非空成功
+        status, body = _allocate(
+            {
+                "calculated_at": CALC,
+                "batches": [],
+                "demands": [{"job_id": "J", "requested": 1}],
+            }
+        )
+        assert status == 422
+        assert body["detail"][0]["type"] == "insufficient_inventory"
+
+    def test_missing_lists_and_calculated_at_aggregate(self) -> None:
+        status, body = _allocate({})
+        assert status == 422
+        missing = {tuple(e["loc"]) for e in body["detail"] if e["type"] == "missing"}
+        assert ("body", "calculated_at") in missing
+        assert ("body", "batches") in missing
+        assert ("body", "demands") in missing
+
+
 class TestDeicingDuplicateIdentifiers:
     def test_duplicate_batch_id_is_field_error(self) -> None:
         errors = _loc_types(

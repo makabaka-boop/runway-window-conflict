@@ -474,6 +474,90 @@ def main() -> int:
         token in error["msg"] for token in ("100.500", "60.000", "40.500")
     ), "缺货错误信息须带出总需求、有效库存与缺口"
 
+    # 15a) 除冰液配给 —— 批次生命周期：计算时刻尚未入库的批次整次 422
+    deicing_future = {
+        "calculated_at": "2026-09-15T02:00:00Z",
+        "batches": [
+            {"batch_id": "FUTURE-1", "available": 100,
+             "received_at": "2026-09-15T03:00:00Z", "expires_at": "2026-09-17T08:00:00Z"},
+        ],
+        "demands": [{"job_id": "JOB-1", "requested": 50}],
+    }
+    status, body = request("POST", "/deicing-allocation", deicing_future)
+    assert_equal(status, 422, "尚未入库批次必须 422")
+    assert_equal(set(body.keys()), {"detail"}, "尚未入库批次无部分配给")
+    (error,) = body["detail"]
+    assert_equal(error["type"], "batch_not_received", "尚未入库错误类型")
+    assert_equal(
+        tuple(error["loc"]),
+        ("body", "batches", 0, "received_at"),
+        "尚未入库错误定位到 received_at",
+    )
+    assert_equal(error["ctx"]["batch_id"], "FUTURE-1", "尚未入库错误带出批次编号")
+
+    # 入库恰等于计算时刻视为已入库，可正常配给
+    deicing_received_now = {
+        "calculated_at": "2026-09-15T02:00:00Z",
+        "batches": [
+            {"batch_id": "NOW-1", "available": 10,
+             "received_at": "2026-09-15T02:00:00Z", "expires_at": "2026-09-17T08:00:00Z"},
+        ],
+        "demands": [{"job_id": "JOB-1", "requested": 4}],
+    }
+    status, body = request("POST", "/deicing-allocation", deicing_received_now)
+    assert_equal(status, 200, "入库恰等于计算时刻应可配给")
+    assert_equal(
+        body["allocations"][0]["lines"],
+        [{"batch_id": "NOW-1", "quantity": 4}],
+        "临界入库批次正常扣减",
+    )
+
+    # 15b) 除冰液配给 —— 批次生命周期：入库晚于失效（倒挂时段）整次 422
+    deicing_inverted = {
+        "calculated_at": "2026-09-15T02:00:00Z",
+        "batches": [
+            {"batch_id": "BAD-1", "available": 100,
+             "received_at": "2026-09-17T08:00:00Z", "expires_at": "2026-09-15T08:00:00Z"},
+        ],
+        "demands": [{"job_id": "JOB-1", "requested": 50}],
+    }
+    status, body = request("POST", "/deicing-allocation", deicing_inverted)
+    assert_equal(status, 422, "入库晚于失效必须 422")
+    assert_equal(
+        {(tuple(e["loc"]), e["type"]) for e in body["detail"]},
+        {(("body", "batches", 0, "expires_at"), "start_not_before_end")},
+        "倒挂时段定位到 expires_at 且只报一个根因",
+    )
+
+    # 15c) 除冰液配给 —— 必填清单：省略 batches / demands 指出两个缺失清单
+    status, body = request(
+        "POST", "/deicing-allocation", {"calculated_at": "2026-09-15T02:00:00Z"}
+    )
+    assert_equal(status, 422, "省略两个必要清单必须 422")
+    assert_equal(
+        {(tuple(e["loc"]), e["type"]) for e in body["detail"]},
+        {(("body", "batches"), "missing"), (("body", "demands"), "missing")},
+        "一次指出 batches 与 demands 两个缺失清单",
+    )
+
+    # 显式空清单仍是合法的无库存 / 无需求配给
+    status, body = request(
+        "POST",
+        "/deicing-allocation",
+        {"calculated_at": "2026-09-15T02:00:00Z", "batches": [], "demands": []},
+    )
+    assert_equal(status, 200, "显式空清单应放行")
+    assert_equal(
+        body,
+        {
+            "calculated_at": "2026-09-15T02:00:00Z",
+            "allocations": [],
+            "remaining": [],
+            "expired_batches": [],
+        },
+        "显式空清单返回完整空配给",
+    )
+
     # 16) 摩擦评定 —— 场景一：正常路面，三段中位数都在良好线以上
     friction_good = {
         "batch_id": "FR-20260915-01",

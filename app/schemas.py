@@ -592,6 +592,16 @@ class DeicingBatchIn(_StrictModel):
             )
         return stripped
 
+    @field_validator("expires_at")
+    @classmethod
+    def _period_order(cls, value: datetime, info: ValidationInfo) -> datetime:
+        # 入库时间必须严格早于失效时间：倒挂或零长时段的库存批次
+        # 没有合法有效期，整次请求在配给前拒绝，错误定位到失效时间。
+        received_at = info.data.get("received_at")
+        if received_at is not None:
+            _check_order(received_at, value)
+        return value
+
 
 class DeicingDemandIn(_StrictModel):
     """一项按优先级排列的除冰作业需求入参。"""
@@ -614,16 +624,23 @@ class DeicingDemandIn(_StrictModel):
 class DeicingAllocationRequest(_StrictModel):
     """一次除冰液配给请求：计算时刻、库存批次与按优先级排列的作业需求。
 
+    ``batches`` 与 ``demands`` 是两个必要清单：键必须显式给出（缺失时
+    各自返回 ``missing`` 字段级错误），但允许显式提交空列表。
     批次编号 / 作业编号的唯一性属于跨条目约束，由
     :func:`app.main._deicing_duplicate_errors` 聚合为字段级 422；
-    总可用量是否足以覆盖总需求由领域层判定。
+    批次相对计算时刻“尚未入库”由 :func:`app.main._deicing_lifecycle_errors`
+    聚合为字段级 422；总可用量是否足以覆盖总需求由领域层判定。
     """
 
     calculated_at: UtcZSecond = Field(
-        ..., description="计算时刻，该时刻已失效的批次不参与配给"
+        ..., description="计算时刻，该时刻已失效或尚未入库的批次不参与配给"
     )
-    batches: list[DeicingBatchIn] = Field(default_factory=list)
-    demands: list[DeicingDemandIn] = Field(default_factory=list)
+    batches: list[DeicingBatchIn] = Field(
+        ..., description="库存批次清单（必要清单，可为空列表）"
+    )
+    demands: list[DeicingDemandIn] = Field(
+        ..., description="按优先级排列的作业需求清单（必要清单，可为空列表）"
+    )
 
 
 class AllocationLineOut(_StrictModel):
