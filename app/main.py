@@ -3,7 +3,9 @@
 - ``GET  /health``               存活探针；
 - ``POST /evaluate``             提交声明跑道、施工窗口、航班占用，逐窗口返回冲突结论；
 - ``POST /inspection-snapshot``  提交巡检批次（应查点位 + 按发生时间记录的事件），
-                                  按批次截止时间折叠出点位现状与未检查、故障数量。
+                                  按批次截止时间折叠出点位现状与未检查、故障数量；
+- ``POST /deicing-allocation``   提交计算时刻、库存批次与按优先级排列的作业需求，
+                                  返回逐项分配明细、批次剩余量与未参与的过期批次。
 
 服务端不保存任何请求间状态：响应完全由请求体决定，可复算、顺序稳定。
 """
@@ -12,6 +14,7 @@ from __future__ import annotations
 
 import json
 import math
+from decimal import Decimal
 from typing import Any, Callable, TypeVar
 
 from fastapi import FastAPI, Request
@@ -21,16 +24,27 @@ from pydantic import BaseModel, ValidationError
 
 from app.domain import (
     EVENT_KINDS,
+    DeicingBatch,
+    DeicingDemand,
+    DuplicateIdentifierError,
     InspectionEvent,
     InspectionPoint,
+    InsufficientInventoryError,
     Occupancy,
     SnapshotContradictionError,
     WorkWindow,
+    allocate_deicing,
     build_inspection_snapshot,
     evaluate,
 )
 from app.schemas import (
+    AllocationLineOut,
+    BatchRemainingOut,
+    DeicingAllocationOut,
+    DeicingAllocationRequest,
+    DemandAllocationOut,
     EvaluationRequest,
+    ExpiredBatchOut,
     InspectionSnapshotOut,
     InspectionSnapshotRequest,
     PointStatusOut,
@@ -41,27 +55,40 @@ from app.schemas import (
 T = TypeVar("T", bound=BaseModel)
 
 app = FastAPI(
-    title="夜间跑道施工放行 / 灯光巡检 API",
-    version="1.1.0",
+    title="夜间跑道施工放行 / 灯光巡检 / 除冰液配给 API",
+    version="1.2.0",
     description=(
         "纯后端、无状态：航班占用两端各扩展十分钟后按半开区间判定冲突；"
-        "巡检批次按截止时间把事件折叠为点位现状。"
+        "巡检批次按截止时间把事件折叠为点位现状；"
+        "除冰液按计算时刻剔除过期批次后先到期先用、逐项配给。"
     ),
 )
 
 
-async def _parse_body(request: Request) -> object:
+async def _parse_body(
+    request: Request,
+    *,
+    parse_float: Callable[[str], Any] | None = None,
+) -> object:
     """读取原始 JSON 请求体；语法错误走标准 422。
 
     使用 ``object_pairs_hook`` 把对象解析为 :class:`_RawObject`，从而保留
     同名键的全部出现——标准解析会静默采用最后一个值，让同一字段携带两个
     不同值（如两个 ``cutoff``）的请求含义不唯一。重复键由
     :func:`_duplicate_key_errors` 汇总成字段级错误。
+
+    ``parse_float`` 供需要精确十进制数量的端点（除冰液配给）把 JSON 小数
+    解析为 :class:`decimal.Decimal`；默认 ``None`` 保持标准 float 行为，
+    既有端点的非有限浮点（Infinity / 1e999）判定不受影响。
     """
 
     raw = await request.body()
     try:
-        return json.loads(raw.decode("utf-8"), object_pairs_hook=_RawObject)
+        return json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_RawObject,
+            parse_float=parse_float,
+        )
     except (ValueError, UnicodeDecodeError):
         raise RequestValidationError(
             [
@@ -297,6 +324,73 @@ def _inspection_reference_errors(payload: object) -> list[dict]:
     return errors
 
 
+def _deicing_duplicate_errors(payload: object) -> list[dict]:
+    """除冰液配给的跨条目约束：批次编号、作业编号在请求内不得重复。
+
+    与模型校验同样只在原始结构形态可识别时尽力提取（非字典条目、
+    非字符串编号等让位给 Pydantic 的字段级错误）；编号先按服务端
+    同样的规则去空白再比较，避免 ``" B1 "`` 与 ``"B1"`` 漏判。
+    """
+
+    if not isinstance(payload, dict):
+        return []
+
+    errors: list[dict] = []
+    for field, id_key, error_type, label in (
+        ("batches", "batch_id", "duplicate_batch_id", "批次编号"),
+        ("demands", "job_id", "duplicate_job_id", "作业编号"),
+    ):
+        items = payload.get(field, [])
+        if not isinstance(items, list):
+            continue
+        seen: dict[str, int] = {}
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            raw_id = item.get(id_key)
+            if not isinstance(raw_id, str) or not raw_id.strip():
+                continue
+            identifier = raw_id.strip()
+            if identifier in seen:
+                errors.append(
+                    {
+                        "type": error_type,
+                        "loc": ("body", field, index, id_key),
+                        "msg": (
+                            f"{label} {identifier!r} 重复声明，"
+                            f"首次出现于 {field}[{seen[identifier]}]"
+                        ),
+                        "input": raw_id,
+                        "ctx": {id_key: identifier, "first_index": seen[identifier]},
+                    }
+                )
+            else:
+                seen[identifier] = index
+    return errors
+
+
+def _insufficient_inventory_errors(exc: InsufficientInventoryError) -> list[dict]:
+    """把领域层的库存不足展开为指出总需求、有效库存与缺口的 422 条目。
+
+    整次请求失败、不返回任何部分配给；三个关键数量同时写进 ``msg``
+    （三位小数）与 ``ctx``（数值），便于人工阅读与程序处理。
+    """
+
+    return [
+        {
+            "type": "insufficient_inventory",
+            "loc": ("body",),
+            "msg": str(exc),
+            "input": None,
+            "ctx": {
+                "total_demand": float(exc.total_demand),
+                "effective_inventory": float(exc.effective_inventory),
+                "shortfall": float(exc.shortfall),
+            },
+        }
+    ]
+
+
 def _contradiction_errors(exc: SnapshotContradictionError) -> list[dict]:
     """把领域层的同秒矛盾事件展开为定位到具体事件的字段级 422 条目。
 
@@ -359,6 +453,18 @@ def _json_safe(value: Any) -> Any:
         if math.isinf(value):
             return "Infinity" if value > 0 else "-Infinity"
         return value
+    if isinstance(value, Decimal):
+        # 除冰液配给以 parse_float=Decimal 解析请求体，校验错误的 input/ctx
+        # 可能携带 Decimal；JSONResponse 无法直接序列化，按 float 同样的
+        # 规则转换（非有限或 float 化溢出时替换为名字符串）。
+        if value.is_nan():
+            return "NaN"
+        if value.is_infinite():
+            return "Infinity" if value > 0 else "-Infinity"
+        as_float = float(value)
+        if math.isinf(as_float):
+            return "Infinity" if as_float > 0 else "-Infinity"
+        return as_float
     if isinstance(value, str):
         try:
             value.encode("utf-8")
@@ -477,4 +583,82 @@ async def inspection_snapshot(request: Request) -> InspectionSnapshotOut:
         ],
         unchecked_count=snapshot.unchecked_count,
         fault_count=snapshot.fault_count,
+    )
+
+
+@app.post("/deicing-allocation", response_model=DeicingAllocationOut)
+async def deicing_allocation(request: Request) -> DeicingAllocationOut:
+    """按计算时刻配给除冰液：过期批次剔除，有效批次先到期先用。
+
+    请求体的小数按 ``Decimal`` 精确解析，数量统一按三位小数计算；
+    任一编号重复、时间格式非法、数量非正或总可用量不足时整次 422，
+    不返回部分配给；库存输入顺序不影响结果。
+    """
+
+    req = _validate_payload(
+        await _parse_body(request, parse_float=Decimal),
+        DeicingAllocationRequest,
+        _deicing_duplicate_errors,
+    )
+
+    batches = [
+        DeicingBatch(
+            batch_id=b.batch_id,
+            available=b.available,
+            received_at=b.received_at,
+            expires_at=b.expires_at,
+        )
+        for b in req.batches
+    ]
+    demands = [
+        DeicingDemand(job_id=d.job_id, requested=d.requested)
+        for d in req.demands
+    ]
+
+    try:
+        report = allocate_deicing(req.calculated_at, batches, demands)
+    except InsufficientInventoryError as exc:
+        raise RequestValidationError(_insufficient_inventory_errors(exc))
+    except DuplicateIdentifierError as exc:
+        # 原始结构检查已先行拒绝全部重复编号，此处仅为兜底，正常不可达。
+        raise RequestValidationError(
+            [
+                {
+                    "type": "duplicate_identifier",
+                    "loc": ("body",),
+                    "msg": str(exc),
+                    "input": exc.identifier,
+                }
+            ]
+        )
+
+    return DeicingAllocationOut(
+        calculated_at=report.calculated_at,
+        allocations=[
+            DemandAllocationOut(
+                job_id=allocation.job_id,
+                requested=allocation.requested,
+                lines=[
+                    AllocationLineOut(
+                        batch_id=line.batch_id,
+                        quantity=line.quantity,
+                    )
+                    for line in allocation.lines
+                ],
+            )
+            for allocation in report.allocations
+        ],
+        remaining=[
+            BatchRemainingOut(batch_id=r.batch_id, remaining=r.remaining)
+            for r in report.remaining
+        ],
+        expired_batches=[
+            ExpiredBatchOut(
+                batch_id=e.batch_id,
+                available=e.available,
+                received_at=e.received_at,
+                expires_at=e.expires_at,
+            )
+            for e in report.expired_batches
+        ],
     )

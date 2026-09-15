@@ -1,11 +1,13 @@
-# 夜间跑道施工放行评估 / 灯光巡检快照 API
+# 夜间跑道施工放行评估 / 灯光巡检快照 / 除冰液配给 API
 
 无状态纯后端服务：
 
 - 一次 **`POST /evaluate`** 请求提交**已声明的跑道代码**、若干**施工窗口**与**航班占用区间**，
   服务逐施工窗口返回与之冲突的航班及交集起止；
 - 一次 **`POST /inspection-snapshot`** 请求提交**巡检批次**（应查点位 + 按发生时间记录的
-  正常 / 故障 / 已修复事件），服务按批次截止时间把事件折叠为各点位现状。
+  正常 / 故障 / 已修复事件），服务按批次截止时间把事件折叠为各点位现状；
+- 一次 **`POST /deicing-allocation`** 请求提交**计算时刻**、**除冰液库存批次**与
+  **按优先级排列的作业需求**，服务返回逐项分配明细、批次剩余量与未参与的过期批次。
 
 响应完全由请求体决定，可复算、顺序稳定，不依赖任何数据库或请求间状态。
 
@@ -188,6 +190,84 @@ THR-C 的修复发生在截止之后、不参与快照，计为未检查。
 }
 ```
 
+## 除冰液配给
+
+`POST /deicing-allocation` 供寒潮期间地勤在作业前核算除冰液批次能否覆盖各机位需求：
+客户端提交**计算时刻**、**库存批次**（编号、可用量、入库时间、失效时间）与
+**按优先级排列的作业需求**（作业编号、申请量），服务整次配给并返回逐项分配明细、
+批次剩余量与未参与的过期批次。
+
+配给规则：
+
+1. **过期剔除**：失效时间 **小于等于** 计算时刻的批次已失效，不参与扣减，
+   原样列入响应的 `expired_batches`（失效时间恰等于计算时刻也算已失效）；
+2. **先到期先用**：有效批次按（失效时间、入库时间、批次编号）稳定排序后逐笔扣减，
+   避免先到批次久置过期；**库存输入顺序不影响结果**；
+3. **优先级扣减**：需求按请求中的顺序逐笔满足，每项需求可拆分到多个批次，
+   拆分明细按扣减顺序列入 `lines`；
+4. **三位小数精确计算**：数量以十进制 `Decimal` 精确运算，入参最多三位小数
+   （`1.2300` 这类末尾带零的写法按数值本身判定，不超精度）；
+5. **整次失败**：批次编号 / 作业编号任一重复、时间格式非法、数量非正（或超过
+   三位小数、非有限、超出可表示范围）时整次请求返回 HTTP 422 字段级错误；
+   **有效库存总量小于总需求**时同样整次 422，不返回任何部分配给，
+   缺货反馈同时指出**总需求、有效库存与缺口**（过期批次不计入有效库存）；
+6. 响应中 `remaining` 覆盖全部有效批次（含被扣减至零的批次），
+   与 `expired_batches` 一样按（失效时间、入库时间、批次编号）排序；
+   时间沿用严格的带 `Z` UTC 秒级格式，数量为 JSON 数值。
+
+请求示例：
+
+```json
+{
+  "calculated_at": "2026-09-15T02:00:00Z",
+  "batches": [
+    {"batch_id": "DZ-02", "available": 60, "received_at": "2026-09-14T21:00:00Z", "expires_at": "2026-09-17T08:00:00Z"},
+    {"batch_id": "DZ-01", "available": 25, "received_at": "2026-09-14T20:00:00Z", "expires_at": "2026-09-15T12:00:00Z"},
+    {"batch_id": "OLD-1", "available": 50, "received_at": "2026-09-13T08:00:00Z", "expires_at": "2026-09-15T02:00:00Z"}
+  ],
+  "demands": [
+    {"job_id": "JOB-1", "requested": 70}
+  ]
+}
+```
+
+响应（`200 OK`）：OLD-1 恰在计算时刻失效不参与配给；DZ-01 先失效先扣减，
+需求 70 拆分为 DZ-01 出 25、DZ-02 出 45。
+
+```json
+{
+  "calculated_at": "2026-09-15T02:00:00Z",
+  "allocations": [
+    {"job_id": "JOB-1", "requested": 70,
+     "lines": [
+       {"batch_id": "DZ-01", "quantity": 25},
+       {"batch_id": "DZ-02", "quantity": 45}
+     ]}
+  ],
+  "remaining": [
+    {"batch_id": "DZ-01", "remaining": 0},
+    {"batch_id": "DZ-02", "remaining": 15}
+  ],
+  "expired_batches": [
+    {"batch_id": "OLD-1", "available": 50,
+     "received_at": "2026-09-13T08:00:00Z", "expires_at": "2026-09-15T02:00:00Z"}
+  ]
+}
+```
+
+库存不足时返回字段级 422（无部分配给，反馈指出总需求、有效库存与缺口）：
+
+```json
+{
+  "detail": [
+    {"type": "insufficient_inventory", "loc": ["body"],
+     "msg": "除冰液有效库存不足：总需求 100.500，有效库存 60.000，缺口 40.500",
+     "input": null,
+     "ctx": {"total_demand": 100.5, "effective_inventory": 60, "shortfall": 40.5}}
+  ]
+}
+```
+
 ## 运行
 
 仅启动 API（容器内监听 8000，默认宿主端口 8000）：
@@ -202,6 +282,7 @@ API_PORT=18080 docker compose up --build
 - 交互式文档：`http://localhost:8000/docs`
 - 评估接口：`POST http://localhost:8000/evaluate`
 - 巡检快照接口：`POST http://localhost:8000/inspection-snapshot`
+- 除冰液配给接口：`POST http://localhost:8000/deicing-allocation`
 
 ### 一次性验收服务 verify
 
@@ -215,7 +296,8 @@ docker compose run --rm verify
 
 1. 等待 `api` 健康检查通过；
 2. 在容器内执行全部 pytest（临界相接、侵入一秒、跨日区间、跑道隔离、排序稳定性、各类 422，
-   以及巡检快照四组确定性场景：未检查 / 故障后修复 / 截止后修复仍故障 / 同秒矛盾 422）；
+   以及巡检快照四组确定性场景：未检查 / 故障后修复 / 截止后修复仍故障 / 同秒矛盾 422，
+   以及除冰液配给四组确定性场景：足量单批次 / 跨批次拆分 / 过期批次排除 / 库存不足）；
 3. 对运行中的 API 执行 `scripts/smoke_http.py`（零第三方依赖，断言真实 HTTP 响应）。
 
 ### 本地直接运行（不用 Docker）
@@ -234,12 +316,15 @@ API_BASE_URL=http://127.0.0.1:8000 python scripts/smoke_http.py
 
 ```
 app/
-  domain.py     # 纯领域逻辑：十分钟扩展、半开相交、排序、巡检事件折叠（无第三方依赖）
-  schemas.py    # Pydantic 请求/响应模型、Z 秒级时间与字段级约束
-  main.py       # FastAPI 装配、422 错误聚合、无状态 /evaluate 与 /inspection-snapshot
+  domain.py     # 纯领域逻辑：十分钟扩展、半开相交、排序、巡检事件折叠、除冰液配给（无第三方依赖）
+  schemas.py    # Pydantic 请求/响应模型、Z 秒级时间、三位小数数量与字段级约束
+  main.py       # FastAPI 装配、422 错误聚合、无状态 /evaluate、/inspection-snapshot 与 /deicing-allocation
 tests/
   test_domain.py
   test_api.py
+  test_deicing_domain.py
+  test_deicing_api.py
+  test_schemas.py
 scripts/
   smoke_http.py # verify 服务使用的真实 HTTP 冒烟脚本（仅标准库）
 Dockerfile

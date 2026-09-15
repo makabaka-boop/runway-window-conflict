@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timezone
+from decimal import Decimal
 import re
 
 from pydantic import (
@@ -140,6 +141,92 @@ def _reject_unpaired_surrogate(value: object) -> str:
 
 #: 会原样回显的自由文本字段专用 str：入口拒绝孤立代理。
 SafeText = Annotated[str, BeforeValidator(_reject_unpaired_surrogate)]
+
+
+#: 数量上限：12 位整数 + 3 位小数。值域内任何三位小数都能无损转为
+#: JSON 数值回显（有效数字不超过 15 位），且 float 化永不溢出。
+MAX_QUANTITY = Decimal("999999999999.999")
+
+
+def validate_quantity(value: object) -> Decimal:
+    """把 JSON 数值解析为最多三位小数的正 ``Decimal``。
+
+    非数值类型（含布尔、字符串）、非有限值（Infinity / NaN）、非正数、
+    超过三位小数或超出可表示范围的值都在此拒绝为字段级错误。
+    三位小数以整数比（``as_integer_ratio``，最低项分数的分母必须整除
+    1000）精确判定，不经过 ``quantize``，因此不受十进制上下文精度影响，
+    ``1.2300`` 这类末尾带零的写法也按数值本身判定。
+    """
+
+    if isinstance(value, bool):
+        # bool 是 int 的子类，必须先拦截：True/False 不是数量。
+        raise PydanticCustomError(
+            "quantity_not_a_number",
+            "数量必须是 JSON 数值，不能是布尔值",
+        )
+    if isinstance(value, Decimal):
+        number = value
+    elif isinstance(value, int):
+        number = Decimal(value)
+    elif isinstance(value, float):
+        # 直接模型校验（单测）可能传入 float；API 入口经 parse_float=Decimal
+        # 解析，只有 Infinity / NaN 这类常量会以 float 到达这里。
+        if not math.isfinite(value):
+            raise PydanticCustomError(
+                "quantity_not_finite",
+                "数量必须是有限数值，不能是 Infinity、-Infinity 或 NaN",
+            )
+        number = Decimal(str(value))
+    else:
+        raise PydanticCustomError(
+            "quantity_not_a_number",
+            "数量必须是 JSON 数值",
+        )
+
+    if not number.is_finite():
+        raise PydanticCustomError(
+            "quantity_not_finite",
+            "数量必须是有限数值，不能是 Infinity、-Infinity 或 NaN",
+        )
+    if number <= 0:
+        raise PydanticCustomError(
+            "quantity_not_positive",
+            "数量必须为正数（严格大于零）",
+        )
+    _numerator, denominator = number.as_integer_ratio()
+    if 1000 % denominator != 0:
+        raise PydanticCustomError(
+            "quantity_too_precise",
+            "数量最多支持三位小数，收到 {value}",
+            {"value": str(number)},
+        )
+    if number > MAX_QUANTITY:
+        raise PydanticCustomError(
+            "quantity_out_of_range",
+            "数量超出可表示范围（最大 {max}）",
+            {"max": str(MAX_QUANTITY)},
+        )
+    return number
+
+
+def serialize_quantity(value: Decimal) -> float:
+    """三位小数数量序列化为 JSON 数值。
+
+    值域已被 :data:`MAX_QUANTITY` 约束，float 化有限且按十进制字面量
+    精确往返（如 ``0.001`` 序列化再解析仍是 ``0.001``）。
+    """
+
+    return float(value)
+
+
+#: 请求数量：正、有限、最多三位小数的 Decimal。
+RequestQuantity = Annotated[Decimal, BeforeValidator(validate_quantity)]
+
+#: 响应数量：序列化为 JSON 数值。
+ResponseQuantity = Annotated[
+    Decimal,
+    PlainSerializer(serialize_quantity, return_type=float),
+]
 
 
 def _check_order(start: datetime, end: datetime) -> None:
@@ -404,3 +491,101 @@ class InspectionSnapshotOut(_StrictModel):
     points: list[PointStatusOut]
     unchecked_count: int = Field(..., ge=0)
     fault_count: int = Field(..., ge=0)
+
+
+# ---------------------------------------------------------------------------
+# 除冰液配给：POST /deicing-allocation
+# ---------------------------------------------------------------------------
+
+
+class DeicingBatchIn(_StrictModel):
+    """一个除冰液库存批次入参。"""
+
+    batch_id: SafeText = Field(..., min_length=1, description="库存批次编号，请求内唯一")
+    available: RequestQuantity = Field(..., description="可用量，正数，最多三位小数")
+    received_at: UtcZSecond = Field(..., description="入库时间（严格 UTC 秒级）")
+    expires_at: UtcZSecond = Field(..., description="失效时间（严格 UTC 秒级）")
+
+    @field_validator("batch_id")
+    @classmethod
+    def _strip_batch_id(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise PydanticCustomError(
+                "blank_batch_id",
+                "库存批次编号不能为空白",
+            )
+        return stripped
+
+
+class DeicingDemandIn(_StrictModel):
+    """一项按优先级排列的除冰作业需求入参。"""
+
+    job_id: SafeText = Field(..., min_length=1, description="作业编号，请求内唯一")
+    requested: RequestQuantity = Field(..., description="申请量，正数，最多三位小数")
+
+    @field_validator("job_id")
+    @classmethod
+    def _strip_job_id(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise PydanticCustomError(
+                "blank_job_id",
+                "作业编号不能为空白",
+            )
+        return stripped
+
+
+class DeicingAllocationRequest(_StrictModel):
+    """一次除冰液配给请求：计算时刻、库存批次与按优先级排列的作业需求。
+
+    批次编号 / 作业编号的唯一性属于跨条目约束，由
+    :func:`app.main._deicing_duplicate_errors` 聚合为字段级 422；
+    总可用量是否足以覆盖总需求由领域层判定。
+    """
+
+    calculated_at: UtcZSecond = Field(
+        ..., description="计算时刻，该时刻已失效的批次不参与配给"
+    )
+    batches: list[DeicingBatchIn] = Field(default_factory=list)
+    demands: list[DeicingDemandIn] = Field(default_factory=list)
+
+
+class AllocationLineOut(_StrictModel):
+    """单项需求从某个批次扣减的一笔数量。"""
+
+    batch_id: str
+    quantity: ResponseQuantity
+
+
+class DemandAllocationOut(_StrictModel):
+    """单项需求的分配明细（可拆分到多个批次）。"""
+
+    job_id: str
+    requested: ResponseQuantity
+    lines: list[AllocationLineOut]
+
+
+class BatchRemainingOut(_StrictModel):
+    """配给结束后单个有效批次的剩余量。"""
+
+    batch_id: str
+    remaining: ResponseQuantity
+
+
+class ExpiredBatchOut(_StrictModel):
+    """计算时刻已失效、未参与配给的批次。"""
+
+    batch_id: str
+    available: ResponseQuantity
+    received_at: UtcZSecond
+    expires_at: UtcZSecond
+
+
+class DeicingAllocationOut(_StrictModel):
+    """除冰液配给结果：逐项分配明细、批次剩余量与未参与的过期批次。"""
+
+    calculated_at: UtcZSecond
+    allocations: list[DemandAllocationOut]
+    remaining: list[BatchRemainingOut]
+    expired_batches: list[ExpiredBatchOut]

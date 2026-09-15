@@ -344,6 +344,136 @@ def main() -> int:
             "unpaired_surrogate",
         ), "孤立代理批次标识须定位到 batch_id 字段"
 
+    # 12) 除冰液配给 —— 场景一：足量单批次覆盖全部需求
+    deicing_single = {
+        "calculated_at": "2026-09-15T02:00:00Z",
+        "batches": [
+            {"batch_id": "DZ-01", "available": 120.5,
+             "received_at": "2026-09-14T20:00:00Z", "expires_at": "2026-09-16T08:00:00Z"},
+        ],
+        "demands": [
+            {"job_id": "JOB-1", "requested": 40.25},
+            {"job_id": "JOB-2", "requested": 30},
+        ],
+    }
+    status, body = request("POST", "/deicing-allocation", deicing_single)
+    assert_equal(status, 200, "除冰配给场景一状态码")
+    assert_equal(body["calculated_at"], "2026-09-15T02:00:00Z", "计算时刻回显")
+    assert_equal(
+        body["allocations"],
+        [
+            {"job_id": "JOB-1", "requested": 40.25,
+             "lines": [{"batch_id": "DZ-01", "quantity": 40.25}]},
+            {"job_id": "JOB-2", "requested": 30,
+             "lines": [{"batch_id": "DZ-01", "quantity": 30}]},
+        ],
+        "足量单批次逐项明细",
+    )
+    assert_equal(
+        body["remaining"],
+        [{"batch_id": "DZ-01", "remaining": 50.25}],
+        "足量单批次剩余量",
+    )
+    assert_equal(body["expired_batches"], [], "场景一无过期批次")
+
+    # 13) 除冰液配给 —— 场景二：跨批次拆分，先失效先用，库存顺序不影响结果
+    deicing_split = {
+        "calculated_at": "2026-09-15T02:00:00Z",
+        "batches": [
+            # 故意把后失效的批次放在前面：扣减顺序由失效时间决定
+            {"batch_id": "DZ-02", "available": 60,
+             "received_at": "2026-09-14T21:00:00Z", "expires_at": "2026-09-17T08:00:00Z"},
+            {"batch_id": "DZ-01", "available": 25,
+             "received_at": "2026-09-14T20:00:00Z", "expires_at": "2026-09-15T12:00:00Z"},
+        ],
+        "demands": [{"job_id": "JOB-9", "requested": 70}],
+    }
+    status, body = request("POST", "/deicing-allocation", deicing_split)
+    assert_equal(status, 200, "除冰配给场景二状态码")
+    assert_equal(
+        body["allocations"][0]["lines"],
+        [
+            {"batch_id": "DZ-01", "quantity": 25},
+            {"batch_id": "DZ-02", "quantity": 45},
+        ],
+        "跨批次拆分：先失效的 DZ-01 先扣减",
+    )
+    assert_equal(
+        body["remaining"],
+        [
+            {"batch_id": "DZ-01", "remaining": 0},
+            {"batch_id": "DZ-02", "remaining": 15},
+        ],
+        "跨批次拆分后的批次剩余量",
+    )
+    deicing_shuffled = dict(deicing_split)
+    deicing_shuffled["batches"] = list(reversed(deicing_split["batches"]))
+    status, body_shuffled = request("POST", "/deicing-allocation", deicing_shuffled)
+    assert_equal(status, 200, "库存倒序提交状态码")
+    assert_equal(body_shuffled, body, "库存输入顺序不影响配给结果")
+
+    # 14) 除冰液配给 —— 场景三：过期批次排除（失效时间 <= 计算时刻即已失效）
+    deicing_expired = {
+        "calculated_at": "2026-09-15T02:00:00Z",
+        "batches": [
+            # 恰在计算时刻失效：不得参与配给
+            {"batch_id": "OLD-1", "available": 50,
+             "received_at": "2026-09-13T08:00:00Z", "expires_at": "2026-09-15T02:00:00Z"},
+            # 计算时刻之后一秒才失效：仍有效
+            {"batch_id": "FR-1", "available": 30,
+             "received_at": "2026-09-14T20:00:00Z", "expires_at": "2026-09-15T02:00:01Z"},
+        ],
+        "demands": [{"job_id": "JOB-1", "requested": 30}],
+    }
+    status, body = request("POST", "/deicing-allocation", deicing_expired)
+    assert_equal(status, 200, "除冰配给场景三状态码")
+    assert_equal(
+        body["allocations"][0]["lines"],
+        [{"batch_id": "FR-1", "quantity": 30}],
+        "过期批次不参与扣减",
+    )
+    assert_equal(
+        body["remaining"],
+        [{"batch_id": "FR-1", "remaining": 0}],
+        "剩余量只含有效批次",
+    )
+    assert_equal(
+        body["expired_batches"],
+        [
+            {"batch_id": "OLD-1", "available": 50,
+             "received_at": "2026-09-13T08:00:00Z",
+             "expires_at": "2026-09-15T02:00:00Z"}
+        ],
+        "过期批次单独报告且数量原样保留",
+    )
+
+    # 15) 除冰液配给 —— 场景四：库存不足整次 422，指出总需求、有效库存与缺口
+    deicing_short = {
+        "calculated_at": "2026-09-15T02:00:00Z",
+        "batches": [
+            {"batch_id": "DZ-01", "available": 60,
+             "received_at": "2026-09-14T20:00:00Z", "expires_at": "2026-09-16T08:00:00Z"},
+            # 过期批次的 50 不计入有效库存
+            {"batch_id": "OLD-1", "available": 50,
+             "received_at": "2026-09-13T08:00:00Z", "expires_at": "2026-09-14T08:00:00Z"},
+        ],
+        "demands": [
+            {"job_id": "JOB-1", "requested": 70},
+            {"job_id": "JOB-2", "requested": 30.5},
+        ],
+    }
+    status, body = request("POST", "/deicing-allocation", deicing_short)
+    assert_equal(status, 422, "库存不足必须 422")
+    assert_equal(set(body.keys()), {"detail"}, "库存不足无部分配给")
+    (error,) = body["detail"]
+    assert_equal(error["type"], "insufficient_inventory", "缺货错误类型")
+    assert_equal(error["ctx"]["total_demand"], 100.5, "缺货反馈总需求")
+    assert_equal(error["ctx"]["effective_inventory"], 60, "缺货反馈有效库存（不含过期批次）")
+    assert_equal(error["ctx"]["shortfall"], 40.5, "缺货反馈缺口")
+    assert all(
+        token in error["msg"] for token in ("100.500", "60.000", "40.500")
+    ), "缺货错误信息须带出总需求、有效库存与缺口"
+
     print("smoke_http: 全部断言通过")
     return 0
 

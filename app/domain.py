@@ -1,4 +1,4 @@
-"""跑道施工冲突判定与跑道灯光巡检快照的纯领域逻辑。
+"""跑道施工冲突判定、跑道灯光巡检快照与除冰液配给的纯领域逻辑。
 
 本模块只依赖标准库，不感知 HTTP / Pydantic，便于直接单测。
 
@@ -18,12 +18,23 @@
 - 同一点位同一时刻出现相互矛盾的结论（``ok`` / ``fault`` / ``repaired``
   中不同的两个）时整次快照失败，由调用方转成字段级 422；
 - 折叠时 ``ok`` 与 ``repaired`` 都映射为现状正常（``normal``）。
+
+除冰液配给规则：
+
+- 失效时间小于等于计算时刻的批次已失效，不参与扣减，单独列入过期批次；
+- 有效批次按（失效时间、入库时间、批次编号）稳定排序，先到先用，
+  结果与库存输入顺序无关；
+- 需求按给定的优先级顺序逐笔扣减，每项需求可拆分到多个批次；
+- 数量统一按三位小数（``Decimal``）精确计算；
+- 批次编号 / 作业编号重复、有效库存总量小于总需求时整次失败，
+  不返回部分配给。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, localcontext
 
 #: 航班占用两端各外扩的安全余量（进场前 / 离场后各十分钟）。
 OCCUPANCY_BUFFER = timedelta(minutes=10)
@@ -345,3 +356,214 @@ def build_inspection_snapshot(
         unchecked_count=unchecked_count,
         fault_count=fault_count,
     )
+
+
+# ---------------------------------------------------------------------------
+# 除冰液配给
+# ---------------------------------------------------------------------------
+
+#: 数量统一按三位小数（0.001）精确计算。
+QUANTUM = Decimal("0.001")
+
+#: 领域加减运算的十进制上下文精度。默认 28 位在极端大数相加时会静默舍入，
+#: 这里放宽到 50 位：输入数量经 API 层约束最多 15 位有效数字，
+#: 50 位足以让任何现实规模的汇总保持精确。
+_DOMAIN_DECIMAL_PRECISION = 50
+
+
+@dataclass(frozen=True)
+class DeicingBatch:
+    """一个除冰液库存批次。"""
+
+    batch_id: str
+    available: Decimal
+    received_at: datetime
+    expires_at: datetime
+
+
+@dataclass(frozen=True)
+class DeicingDemand:
+    """一项按优先级排列的除冰作业需求。"""
+
+    job_id: str
+    requested: Decimal
+
+
+@dataclass(frozen=True)
+class AllocationLine:
+    """单项需求从某个批次扣减的一笔数量。"""
+
+    batch_id: str
+    quantity: Decimal
+
+
+@dataclass(frozen=True)
+class DemandAllocation:
+    """单项需求的分配明细；``lines`` 为空表示该需求未获配（仅零申请时）。"""
+
+    job_id: str
+    requested: Decimal
+    lines: tuple[AllocationLine, ...]
+
+
+@dataclass(frozen=True)
+class BatchRemaining:
+    """配给结束后单个有效批次的剩余量（可能为零）。"""
+
+    batch_id: str
+    remaining: Decimal
+
+
+@dataclass(frozen=True)
+class ExpiredBatch:
+    """计算时刻已失效、未参与配给的批次，数量原样保留。"""
+
+    batch_id: str
+    available: Decimal
+    received_at: datetime
+    expires_at: datetime
+
+
+@dataclass(frozen=True)
+class DeicingAllocationReport:
+    """一次除冰液配给的完整结果。"""
+
+    calculated_at: datetime
+    allocations: tuple[DemandAllocation, ...]
+    remaining: tuple[BatchRemaining, ...]
+    expired_batches: tuple[ExpiredBatch, ...]
+
+
+class DuplicateIdentifierError(ValueError):
+    """批次编号或作业编号重复，整次请求必须失败。"""
+
+    def __init__(self, kind: str, identifier: str) -> None:
+        self.kind = kind
+        self.identifier = identifier
+        label = "批次编号" if kind == "batch" else "作业编号"
+        super().__init__(f"{label}重复: {identifier}")
+
+
+class InsufficientInventoryError(ValueError):
+    """有效库存总量小于总需求，整次请求失败且不返回部分配给。
+
+    反馈必须指出总需求、有效库存与缺口，供调用方转成 422 错误信封。
+    """
+
+    def __init__(self, total_demand: Decimal, effective_inventory: Decimal) -> None:
+        self.total_demand = total_demand
+        self.effective_inventory = effective_inventory
+        self.shortfall = total_demand - effective_inventory
+        super().__init__(
+            "除冰液有效库存不足："
+            f"总需求 {total_demand:.3f}，"
+            f"有效库存 {effective_inventory:.3f}，"
+            f"缺口 {self.shortfall:.3f}"
+        )
+
+
+def _deicing_batch_key(batch: DeicingBatch) -> tuple:
+    """批次扣减顺序：失效时间、入库时间、批次编号。
+
+    先失效的批次先扣减，避免先到批次久置过期；编号唯一，排序完全确定，
+    与库存输入顺序无关。
+    """
+
+    return (batch.expires_at, batch.received_at, batch.batch_id)
+
+
+def allocate_deicing(
+    calculated_at: datetime,
+    batches: list[DeicingBatch],
+    demands: list[DeicingDemand],
+) -> DeicingAllocationReport:
+    """按计算时刻对除冰液需求做整次配给。
+
+    流程（顺序很重要）：
+
+    1. 批次编号、作业编号任一重复即整次失败
+       （:class:`DuplicateIdentifierError`）；
+    2. 失效时间小于等于 ``calculated_at`` 的批次已失效，不参与扣减，
+       原样列入 ``expired_batches``；
+    3. 有效批次按（失效时间、入库时间、批次编号）稳定排序——
+       库存输入顺序不影响结果；
+    4. 有效库存总量小于总需求时整次失败
+       （:class:`InsufficientInventoryError`），不返回部分配给；
+    5. 需求按给定的优先级顺序逐笔扣减，每项需求可拆分到多个批次，
+       扣减顺序即第 3 步的批次顺序；
+    6. 数量以 ``Decimal`` 精确运算；调用方负责三位小数约束
+       （API 层强制），因此全部结果同样精确到三位小数。
+
+    本函数是纯函数：相同输入永远得到相同、顺序稳定的输出。
+    """
+
+    seen_batches: set[str] = set()
+    for batch in batches:
+        if batch.batch_id in seen_batches:
+            raise DuplicateIdentifierError("batch", batch.batch_id)
+        seen_batches.add(batch.batch_id)
+    seen_jobs: set[str] = set()
+    for demand in demands:
+        if demand.job_id in seen_jobs:
+            raise DuplicateIdentifierError("job", demand.job_id)
+        seen_jobs.add(demand.job_id)
+
+    with localcontext() as context:
+        context.prec = _DOMAIN_DECIMAL_PRECISION
+
+        valid = sorted(
+            (b for b in batches if b.expires_at > calculated_at),
+            key=_deicing_batch_key,
+        )
+        expired = sorted(
+            (b for b in batches if b.expires_at <= calculated_at),
+            key=_deicing_batch_key,
+        )
+
+        total_demand = sum((d.requested for d in demands), Decimal(0))
+        effective_inventory = sum((b.available for b in valid), Decimal(0))
+        if effective_inventory < total_demand:
+            raise InsufficientInventoryError(total_demand, effective_inventory)
+
+        pool = {batch.batch_id: batch.available for batch in valid}
+        allocations: list[DemandAllocation] = []
+        for demand in demands:
+            needed = demand.requested
+            lines: list[AllocationLine] = []
+            for batch in valid:
+                if needed <= 0:
+                    break
+                remaining = pool[batch.batch_id]
+                if remaining <= 0:
+                    continue
+                take = min(remaining, needed)
+                pool[batch.batch_id] = remaining - take
+                needed -= take
+                lines.append(
+                    AllocationLine(batch_id=batch.batch_id, quantity=take)
+                )
+            allocations.append(
+                DemandAllocation(
+                    job_id=demand.job_id,
+                    requested=demand.requested,
+                    lines=tuple(lines),
+                )
+            )
+
+        return DeicingAllocationReport(
+            calculated_at=calculated_at,
+            allocations=tuple(allocations),
+            remaining=tuple(
+                BatchRemaining(batch_id=b.batch_id, remaining=pool[b.batch_id])
+                for b in valid
+            ),
+            expired_batches=tuple(
+                ExpiredBatch(
+                    batch_id=b.batch_id,
+                    available=b.available,
+                    received_at=b.received_at,
+                    expires_at=b.expires_at,
+                )
+                for b in expired
+            ),
+        )
