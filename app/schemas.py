@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 import re
 
@@ -54,6 +55,15 @@ def validate_utc_z_seconds(value: object) -> datetime:
         return aware
 
     if not isinstance(value, str):
+        # JSON 的 Infinity / NaN（即便作为裸 token 出现）会被解析成
+        # float；这类非有限数值无法序列化为合法 JSON，必须在这里显式
+        # 拒绝成字段级错误，而不是让错误回显阶段抛内部错误。
+        if isinstance(value, float) and not math.isfinite(value):
+            raise PydanticCustomError(
+                "not_finite_datetime",
+                "截止时间必须是有限的带 Z 的 ISO 8601 UTC 秒级字符串，"
+                "不能是 Infinity、-Infinity 或 NaN",
+            )
         raise PydanticCustomError(
             "not_utc_z_string",
             "时间必须是带 Z 的 ISO 8601 UTC 秒级字符串，例如 2026-09-14T22:30:00Z",
@@ -106,6 +116,32 @@ class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+def _reject_unpaired_surrogate(value: object) -> str:
+    """拒绝含孤立代理（如 ``\\ud800``）的文本。
+
+    JSON 以 ``\\uXXXX`` 转义形式携带的孤立代理会被解析成 Python 字符串，
+    但它无法编码为 UTF-8：若放行，字段回显阶段会直接抛内部错误。
+    作为 ``BeforeValidator`` 在内置 str 校验之前拦截，所有会原样回显的
+    标识字段统一使用 :data:`SafeText`。
+    """
+
+    if not isinstance(value, str):
+        # 非字符串交给后续内置校验，按标准类型错误返回。
+        return value  # type: ignore[return-value]
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise PydanticCustomError(
+            "unpaired_surrogate",
+            "文本含孤立代理字符，不是合法的 Unicode 字符串",
+        )
+    return value
+
+
+#: 会原样回显的自由文本字段专用 str：入口拒绝孤立代理。
+SafeText = Annotated[str, BeforeValidator(_reject_unpaired_surrogate)]
+
+
 def _check_order(start: datetime, end: datetime) -> None:
     if not start < end:
         # 挂在 end 字段上，定位到具体是哪一段区间。
@@ -146,7 +182,7 @@ def _normalize_runway_codes(values: list[str]) -> list[str]:
 class WorkWindowIn(_StrictModel):
     """单段施工窗口入参。"""
 
-    runway: str = Field(..., min_length=1, description="已声明的跑道代码")
+    runway: SafeText = Field(..., min_length=1, description="已声明的跑道代码")
     start: UtcZSecond
     end: UtcZSecond
 
@@ -173,8 +209,8 @@ class WorkWindowIn(_StrictModel):
 class OccupancyIn(_StrictModel):
     """单段航班占用入参（端点在领域层外扩十分钟）。"""
 
-    runway: str = Field(..., min_length=1, description="已声明的跑道代码")
-    flight_id: str = Field(..., min_length=1, description="航班标识")
+    runway: SafeText = Field(..., min_length=1, description="已声明的跑道代码")
+    flight_id: SafeText = Field(..., min_length=1, description="航班标识")
     start: UtcZSecond
     end: UtcZSecond
 
@@ -215,7 +251,7 @@ class EvaluationRequest(_StrictModel):
     :func:`app.main.unknown_runway_errors` 聚合为字段级 422 错误。
     """
 
-    runways: list[str] = Field(
+    runways: list[SafeText] = Field(
         ...,
         min_length=1,
         description="本请求已声明的跑道代码集合，窗口/占用引用的跑道必须在此声明",
@@ -257,8 +293,8 @@ EventKind = Literal[EVENT_OK, EVENT_FAULT, EVENT_REPAIRED]
 class InspectionPointIn(_StrictModel):
     """一条跑道上应巡检的灯光点位。"""
 
-    runway: str = Field(..., min_length=1, description="已声明的跑道代码")
-    code: str = Field(..., min_length=1, description="点位标识，同一批次内跑道内唯一")
+    runway: SafeText = Field(..., min_length=1, description="已声明的跑道代码")
+    code: SafeText = Field(..., min_length=1, description="点位标识，同一批次内跑道内唯一")
 
     @field_validator("runway")
     @classmethod
@@ -286,8 +322,8 @@ class InspectionPointIn(_StrictModel):
 class InspectionEventIn(_StrictModel):
     """按发生时间记录的一条点位事件（正常 / 故障 / 已修复）。"""
 
-    runway: str = Field(..., min_length=1, description="已声明的跑道代码")
-    point: str = Field(..., min_length=1, description="本批次声明过的点位标识")
+    runway: SafeText = Field(..., min_length=1, description="已声明的跑道代码")
+    point: SafeText = Field(..., min_length=1, description="本批次声明过的点位标识")
     observed_at: UtcZSecond = Field(..., description="事件发生时间（严格 UTC 秒级）")
     kind: EventKind
 
@@ -322,9 +358,9 @@ class InspectionSnapshotRequest(_StrictModel):
     同秒矛盾事件由领域层判定。
     """
 
-    batch_id: str = Field(..., min_length=1, description="巡检批次标识")
+    batch_id: SafeText = Field(..., min_length=1, description="巡检批次标识")
     cutoff: UtcZSecond = Field(..., description="批次截止时间，之后的记录不参与快照")
-    runways: list[str] = Field(
+    runways: list[SafeText] = Field(
         ...,
         min_length=1,
         description="本批次已声明的跑道代码集合，点位/事件引用的跑道必须在此声明",

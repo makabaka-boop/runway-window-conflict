@@ -732,3 +732,153 @@ class TestInspectionSnapshotFieldErrors:
         locs = {tuple(e["loc"]) for e in body["detail"]}
         assert ("body", "points", 0, "runway") in locs
         assert ("body", "events", 0, "observed_at") in locs
+
+    def test_non_finite_cutoff_is_field_error_not_internal_error(self) -> None:
+        # JSON 的 Infinity / -Infinity / NaN（含溢出成 inf 的 1e999）
+        # 此前在错误响应序列化阶段触发 500，必须在 cutoff 字段处拒绝为 422。
+        for token in ("Infinity", "-Infinity", "NaN", "1e999"):
+            raw = (
+                '{"batch_id":"B1","runways":["36L"],'
+                '"points":[{"runway":"36L","code":"P1"}],"events":[],'
+                f'"cutoff":{token}}}'
+            )
+            resp = client.post(
+                "/inspection-snapshot",
+                content=raw,
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status_code == 422, token
+            errors = resp.json()["detail"]
+            assert (
+                tuple(errors[0]["loc"]),
+                errors[0]["type"],
+            ) == (("body", "cutoff"), "not_finite_datetime"), token
+            assert "截止时间" in errors[0]["msg"], token
+            # 错误响应自身必须仍是合法 JSON（input 不得携带非有限浮点）
+            assert "detail" in resp.json()
+
+    def test_non_finite_event_time_rejected_on_evaluate_too(self) -> None:
+        raw = (
+            '{"runways":["36L"],'
+            '"work_windows":[{"runway":"36L",'
+            '"start":"2026-09-15T02:00:00Z","end":Infinity}],'
+            '"occupancies":[]}'
+        )
+        resp = client.post(
+            "/evaluate",
+            content=raw,
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 422
+        assert (
+            tuple(resp.json()["detail"][0]["loc"]),
+            resp.json()["detail"][0]["type"],
+        ) == (("body", "work_windows", 0, "end"), "not_finite_datetime")
+
+    def test_duplicate_cutoff_keys_rejected(self) -> None:
+        # 两个不同的截止时间不得静默采用后一个；即使值相同也含义不唯一。
+        raw = (
+            '{"batch_id":"B1",'
+            '"cutoff":"2026-09-15T03:00:00Z",'
+            '"cutoff":"2026-09-15T04:00:00Z",'
+            '"runways":["36L"],'
+            '"points":[{"runway":"36L","code":"P1"}],"events":[]}'
+        )
+        resp = client.post(
+            "/inspection-snapshot",
+            content=raw,
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 422
+        errors = resp.json()["detail"]
+        assert all(e["type"] == "duplicate_field" for e in errors)
+        assert tuple(errors[0]["loc"]) == ("body", "cutoff")
+
+    def test_duplicate_key_inside_nested_object_rejected(self) -> None:
+        raw = (
+            '{"batch_id":"B1","cutoff":"2026-09-15T03:00:00Z","runways":["36L"],'
+            '"points":[{"runway":"36L","code":"P1"}],'
+            '"events":[{"runway":"36L","point":"P1","point":"P1",'
+            '"observed_at":"2026-09-15T02:00:00Z","kind":"ok"}]}'
+        )
+        resp = client.post(
+            "/inspection-snapshot",
+            content=raw,
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 422
+        assert (
+            ("body", "events", 0, "point"),
+            "duplicate_field",
+        ) in {(tuple(e["loc"]), e["type"]) for e in resp.json()["detail"]}
+
+    def test_duplicate_keys_rejected_on_evaluate(self) -> None:
+        raw = (
+            '{"runways":["36L"],"runways":["18R"],'
+            '"work_windows":[],"occupancies":[]}'
+        )
+        resp = client.post(
+            "/evaluate",
+            content=raw,
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 422
+        assert (
+            ("body", "runways"),
+            "duplicate_field",
+        ) in {(tuple(e["loc"]), e["type"]) for e in resp.json()["detail"]}
+
+    def test_lone_surrogate_in_batch_id_rejected_at_batch_id(self) -> None:
+        # \\uD800 是孤立高代理：此前在快照回显序列化阶段触发 500，
+        # 必须在 batch_id 字段处明确拒绝。
+        raw = (
+            '{"batch_id":"BATCH-\\uD800-TAIL",'
+            '"cutoff":"2026-09-15T03:00:00Z","runways":["36L"],'
+            '"points":[{"runway":"36L","code":"P1"}],"events":[]}'
+        )
+        resp = client.post(
+            "/inspection-snapshot",
+            content=raw.encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 422
+        errors = resp.json()["detail"]
+        assert (
+            tuple(errors[0]["loc"]),
+            errors[0]["type"],
+        ) == (("body", "batch_id"), "unpaired_surrogate")
+
+    def test_lone_surrogate_in_other_identifier_fields_rejected_in_place(self) -> None:
+        for field, loc in (
+            ("runways", ("body", "runways", 0)),
+            ("point_code", ("body", "points", 0, "code")),
+            ("event_runway", ("body", "events", 0, "runway")),
+        ):
+            if field == "runways":
+                raw = (
+                    '{"batch_id":"B1","cutoff":"2026-09-15T03:00:00Z",'
+                    '"runways":["36L\\uD800"],'
+                    '"points":[{"runway":"36L\\uD800","code":"P1"}],"events":[]}'
+                )
+            elif field == "point_code":
+                raw = (
+                    '{"batch_id":"B1","cutoff":"2026-09-15T03:00:00Z",'
+                    '"runways":["36L"],'
+                    '"points":[{"runway":"36L","code":"P1\\uD800"}],"events":[]}'
+                )
+            else:
+                raw = (
+                    '{"batch_id":"B1","cutoff":"2026-09-15T03:00:00Z",'
+                    '"runways":["36L"],'
+                    '"points":[{"runway":"36L","code":"P1"}],'
+                    '"events":[{"runway":"36L\\uD800","point":"P1",'
+                    '"observed_at":"2026-09-15T02:00:00Z","kind":"ok"}]}'
+                )
+            resp = client.post(
+                "/inspection-snapshot",
+                content=raw.encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status_code == 422, field
+            locs_types = {(tuple(e["loc"]), e["type"]) for e in resp.json()["detail"]}
+            assert (loc, "unpaired_surrogate") in locs_types, field

@@ -11,7 +11,8 @@
 from __future__ import annotations
 
 import json
-from typing import Callable, TypeVar
+import math
+from typing import Any, Callable, TypeVar
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -50,11 +51,17 @@ app = FastAPI(
 
 
 async def _parse_body(request: Request) -> object:
-    """读取原始 JSON 请求体；语法错误走标准 422。"""
+    """读取原始 JSON 请求体；语法错误走标准 422。
+
+    使用 ``object_pairs_hook`` 把对象解析为 :class:`_RawObject`，从而保留
+    同名键的全部出现——标准解析会静默采用最后一个值，让同一字段携带两个
+    不同值（如两个 ``cutoff``）的请求含义不唯一。重复键由
+    :func:`_duplicate_key_errors` 汇总成字段级错误。
+    """
 
     raw = await request.body()
     try:
-        return json.loads(raw.decode("utf-8"))
+        return json.loads(raw.decode("utf-8"), object_pairs_hook=_RawObject)
     except (ValueError, UnicodeDecodeError):
         raise RequestValidationError(
             [
@@ -66,6 +73,49 @@ async def _parse_body(request: Request) -> object:
                 }
             ]
         )
+
+
+class _RawObject(dict):
+    """保留同名键全部出现的 JSON 对象（行为与普通 dict 一致，取最后一个值）。"""
+
+    def __init__(self, pairs: list[tuple[str, Any]]) -> None:
+        super().__init__(pairs)
+        self.pairs = pairs
+
+
+def _duplicate_key_errors(payload: object) -> list[dict]:
+    """提取请求体内所有重复 JSON 键的字段级错误，loc 指向后一个重复键。
+
+    嵌套对象（如 ``events[i]``）中的重复键同样拒绝；列表与普通对象
+    都递归遍历，而 :class:`_RawObject` 以输入的键值对序列为准。
+    """
+
+    errors: list[dict] = []
+
+    def walk(node: object, path: tuple[str | int, ...]) -> None:
+        if isinstance(node, _RawObject):
+            seen: set[str] = set()
+            for key, value in node.pairs:
+                if key in seen:
+                    errors.append(
+                        {
+                            "type": "duplicate_field",
+                            "loc": ("body", *path, key),
+                            "msg": f"字段 {key!r} 在同一对象中重复出现，请求含义不唯一",
+                            "input": key,
+                        }
+                    )
+                seen.add(key)
+                walk(value, (*path, key))
+        elif isinstance(node, dict):
+            for key, value in node.items():
+                walk(value, (*path, key))
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                walk(value, (*path, index))
+
+    walk(payload, ())
+    return errors
 
 
 def _validate_payload(
@@ -86,6 +136,8 @@ def _validate_payload(
     except ValidationError as exc:
         errors.extend(_prefix_loc(exc.errors(), "body"))
 
+    # 重复 JSON 键在语义层对两个端点都非法，与具体模型无关，统一在此聚合。
+    errors.extend(_duplicate_key_errors(payload))
     errors.extend(extra_errors(payload))
 
     if errors:
@@ -292,9 +344,39 @@ def _prefix_loc(errors: list[dict], prefix: str) -> list[dict]:
     return fixed
 
 
+def _json_safe(value: Any) -> Any:
+    """把无法编进合法 JSON 的错误回显值替换为可序列化表示。
+
+    最后一道防线：校验错误的 ``input`` / ``ctx`` 会原样回显请求值，其中
+    可能携带 Infinity / NaN（非有限 float）或含孤立代理的字符串；直接交给
+    ``JSONResponse``（``allow_nan=False``、UTF-8）会把本应 422 的请求
+    渲染成 500。非有限浮点替换为名字符串，孤立代理转义为 ``\\uXXXX``。
+    """
+
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "NaN"
+        if math.isinf(value):
+            return "Infinity" if value > 0 else "-Infinity"
+        return value
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            return value.encode("utf-8", errors="backslashreplace").decode("utf-8")
+        return value
+    if isinstance(value, dict):
+        return {_json_safe(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 @app.exception_handler(RequestValidationError)
 async def _on_validation_error(request: Request, exc: RequestValidationError):
-    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+    return JSONResponse(
+        status_code=422, content=_json_safe({"detail": exc.errors()})
+    )
 
 
 @app.get("/health")

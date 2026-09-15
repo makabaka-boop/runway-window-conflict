@@ -268,6 +268,82 @@ def main() -> int:
         "body", "events", 0, "point"
     ) in {tuple(e["loc"]) for e in body["detail"]}, "未声明点位须定位到 point 字段"
 
+    # 9) 非有限截止时间（Infinity / NaN）必须在 cutoff 字段处拒绝，不得 500
+    raw_request = urllib.request.Request(
+        BASE_URL + "/inspection-snapshot",
+        data=(
+            b'{"batch_id":"B1","cutoff":Infinity,"runways":["36L"],'
+            b'"points":[{"runway":"36L","code":"P1"}],"events":[]}'
+        ),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(raw_request, timeout=10) as resp:
+            raise AssertionError(f"Infinity cutoff 必须 422，实际 {resp.status}")
+    except urllib.error.HTTPError as exc:
+        assert_equal(exc.code, 422, "Infinity cutoff 必须 422")
+        body = json.loads(exc.read().decode("utf-8"))
+        assert (
+            tuple(body["detail"][0]["loc"]),
+            body["detail"][0]["type"],
+        ) == (
+            ("body", "cutoff"),
+            "not_finite_datetime",
+        ), "非有限截止时间须定位到 cutoff 字段"
+
+    # 10) 两个不同的 cutoff（重复 JSON 键）必须拒绝，不得静默采用后一个
+    raw_request = urllib.request.Request(
+        BASE_URL + "/inspection-snapshot",
+        data=(
+            b'{"batch_id":"B1",'
+            b'"cutoff":"2026-09-15T03:00:00Z",'
+            b'"cutoff":"2026-09-15T04:00:00Z",'
+            b'"runways":["36L"],'
+            b'"points":[{"runway":"36L","code":"P1"}],"events":[]}'
+        ),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(raw_request, timeout=10) as resp:
+            raise AssertionError(f"重复 cutoff 必须 422，实际 {resp.status}")
+    except urllib.error.HTTPError as exc:
+        assert_equal(exc.code, 422, "重复 cutoff 必须 422")
+        body = json.loads(exc.read().decode("utf-8"))
+        assert (
+            tuple(body["detail"][0]["loc"]),
+            body["detail"][0]["type"],
+        ) == (
+            ("body", "cutoff"),
+            "duplicate_field",
+        ), "重复截止时间须定位到 cutoff 字段"
+
+    # 11) 批次标识含孤立代理字符（\uD800）必须在 batch_id 处拒绝，不得 500
+    raw_request = urllib.request.Request(
+        BASE_URL + "/inspection-snapshot",
+        data=(
+            b'{"batch_id":"BATCH-\\uD800-TAIL",'
+            b'"cutoff":"2026-09-15T03:00:00Z","runways":["36L"],'
+            b'"points":[{"runway":"36L","code":"P1"}],"events":[]}'
+        ),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(raw_request, timeout=10) as resp:
+            raise AssertionError(f"孤立代理 batch_id 必须 422，实际 {resp.status}")
+    except urllib.error.HTTPError as exc:
+        assert_equal(exc.code, 422, "孤立代理批次标识必须 422")
+        body = json.loads(exc.read().decode("utf-8"))
+        assert (
+            tuple(body["detail"][0]["loc"]),
+            body["detail"][0]["type"],
+        ) == (
+            ("body", "batch_id"),
+            "unpaired_surrogate",
+        ), "孤立代理批次标识须定位到 batch_id 字段"
+
     print("smoke_http: 全部断言通过")
     return 0
 
