@@ -24,7 +24,17 @@ from pydantic import (
 from pydantic_core import PydanticCustomError
 from typing import Annotated, Literal
 
-from app.domain import EVENT_FAULT, EVENT_OK, EVENT_REPAIRED
+from app.domain import (
+    EVENT_FAULT,
+    EVENT_OK,
+    EVENT_REPAIRED,
+    GRADE_GOOD,
+    GRADE_POOR,
+    GRADE_RESTRICTED,
+    SEGMENT_MIDPOINT,
+    SEGMENT_ROLLOUT,
+    SEGMENT_TOUCHDOWN,
+)
 
 #: 秒级、仅 Z 结尾的 ISO 8601 UTC 时间（拒绝小数秒与偏移量）。
 _Z_SECONDS_RE = re.compile(
@@ -224,6 +234,71 @@ RequestQuantity = Annotated[Decimal, BeforeValidator(validate_quantity)]
 
 #: 响应数量：序列化为 JSON 数值。
 ResponseQuantity = Annotated[
+    Decimal,
+    PlainSerializer(serialize_quantity, return_type=float),
+]
+
+
+def validate_coefficient(value: object) -> Decimal:
+    """把 JSON 数值解析为 0 至 1（含端点）、最多三位小数的摩擦系数。
+
+    与 :func:`validate_quantity` 同一套精确判定（整数比判三位小数、
+    不经过 ``quantize``），但取值域是闭区间 [0, 1]：0 与 1 都是合法
+    系数，超出即字段级错误；非数值（含布尔、字符串）与非有限值同样拒绝。
+    """
+
+    if isinstance(value, bool):
+        # bool 是 int 的子类，必须先拦截：True/False 不是系数。
+        raise PydanticCustomError(
+            "coefficient_not_a_number",
+            "摩擦系数必须是 JSON 数值，不能是布尔值",
+        )
+    if isinstance(value, Decimal):
+        number = value
+    elif isinstance(value, int):
+        number = Decimal(value)
+    elif isinstance(value, float):
+        # API 入口经 parse_float=Decimal 解析，只有 Infinity / NaN 这类
+        # 常量会以 float 到达这里；直接模型校验（单测）可能传入有限 float。
+        if not math.isfinite(value):
+            raise PydanticCustomError(
+                "coefficient_not_finite",
+                "摩擦系数必须是有限数值，不能是 Infinity、-Infinity 或 NaN",
+            )
+        number = Decimal(str(value))
+    else:
+        raise PydanticCustomError(
+            "coefficient_not_a_number",
+            "摩擦系数必须是 JSON 数值",
+        )
+
+    if not number.is_finite():
+        raise PydanticCustomError(
+            "coefficient_not_finite",
+            "摩擦系数必须是有限数值，不能是 Infinity、-Infinity 或 NaN",
+        )
+    if number < 0 or number > 1:
+        raise PydanticCustomError(
+            "coefficient_out_of_range",
+            "摩擦系数必须在 0 至 1 之间（含端点），收到 {value}",
+            {"value": str(number)},
+        )
+    _numerator, denominator = number.as_integer_ratio()
+    if 1000 % denominator != 0:
+        raise PydanticCustomError(
+            "coefficient_too_precise",
+            "摩擦系数最多支持三位小数，收到 {value}",
+            {"value": str(number)},
+        )
+    return number
+
+
+#: 请求摩擦系数：0 至 1（含端点）、有限、最多三位小数的 Decimal。
+RequestCoefficient = Annotated[Decimal, BeforeValidator(validate_coefficient)]
+
+#: 响应摩擦系数 / 中位数：序列化为 JSON 数值（偶数条中位数最多四位小数，
+#: 有效数字远少于 15 位，float 化按十进制字面量精确往返）。
+ResponseCoefficient = Annotated[
     Decimal,
     PlainSerializer(serialize_quantity, return_type=float),
 ]
@@ -589,3 +664,109 @@ class DeicingAllocationOut(_StrictModel):
     allocations: list[DemandAllocationOut]
     remaining: list[BatchRemainingOut]
     expired_batches: list[ExpiredBatchOut]
+
+
+# ---------------------------------------------------------------------------
+# 跑道摩擦测量批次评定：POST /friction-assessment
+# ---------------------------------------------------------------------------
+
+#: 法定分段取值，与领域层常量保持一致；此外的分段名一律非法（字段级 422）。
+SegmentName = Literal[SEGMENT_TOUCHDOWN, SEGMENT_MIDPOINT, SEGMENT_ROLLOUT]
+
+#: 总体等级取值，与领域层常量保持一致。
+GradeName = Literal[GRADE_GOOD, GRADE_RESTRICTED, GRADE_POOR]
+
+
+class FrictionReadingIn(_StrictModel):
+    """一条测点读数入参：批次内唯一编号 + 三位小数摩擦系数。"""
+
+    reading_id: SafeText = Field(..., min_length=1, description="读数编号，批次内唯一")
+    coefficient: RequestCoefficient = Field(
+        ..., description="摩擦系数，0 至 1（含端点），最多三位小数"
+    )
+
+    @field_validator("reading_id")
+    @classmethod
+    def _strip_reading_id(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise PydanticCustomError(
+                "blank_reading_id",
+                "读数编号不能为空白",
+            )
+        return stripped
+
+
+class FrictionSegmentIn(_StrictModel):
+    """一个分段及其全部测点读数。
+
+    分段必须恰好覆盖着陆段 / 中段 / 滑跑段各一次、每段至少三条读数，
+    属于跨条目约束，由 :func:`app.main._friction_assessment_errors`
+    聚合为字段级 422。
+    """
+
+    segment: SegmentName
+    readings: list[FrictionReadingIn]
+
+
+class FrictionAssessmentRequest(_StrictModel):
+    """一次摩擦测量批次评定请求：批次编号、跑道、测量时刻与分段读数。
+
+    跑道必须在本请求的 ``runways`` 中声明；分段齐备性、读数编号唯一性
+    等跨条目约束由 :func:`app.main._friction_assessment_errors` 聚合。
+    """
+
+    batch_id: SafeText = Field(..., min_length=1, description="测量批次编号")
+    runways: list[SafeText] = Field(
+        ...,
+        min_length=1,
+        description="本请求已声明的跑道代码集合，测量跑道必须在此声明",
+    )
+    runway: SafeText = Field(..., min_length=1, description="实施测量的跑道代码")
+    measured_at: UtcZSecond = Field(..., description="测量时刻（严格 UTC 秒级）")
+    segments: list[FrictionSegmentIn] = Field(..., min_length=1)
+
+    @field_validator("batch_id")
+    @classmethod
+    def _strip_batch_id(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise PydanticCustomError(
+                "blank_batch_id",
+                "测量批次编号不能为空白",
+            )
+        return stripped
+
+    @field_validator("runways")
+    @classmethod
+    def _normalize_runways(cls, values: list[str]) -> list[str]:
+        return _normalize_runway_codes(values)
+
+    @field_validator("runway")
+    @classmethod
+    def _strip_runway(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise PydanticCustomError(
+                "blank_runway",
+                "跑道代码不能为空白",
+            )
+        return stripped
+
+
+class SegmentMedianOut(_StrictModel):
+    """一个分段的评定中位数。"""
+
+    segment: SegmentName
+    median: ResponseCoefficient
+
+
+class FrictionAssessmentOut(_StrictModel):
+    """摩擦批次评定结论：分段中位数（固定顺序）与全跑道总体等级。"""
+
+    batch_id: str
+    runway: str
+    measured_at: UtcZSecond
+    segments: list[SegmentMedianOut]
+    overall_coefficient: ResponseCoefficient
+    overall_grade: GradeName

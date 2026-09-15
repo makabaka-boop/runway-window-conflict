@@ -5,7 +5,9 @@
 - ``POST /inspection-snapshot``  提交巡检批次（应查点位 + 按发生时间记录的事件），
                                   按批次截止时间折叠出点位现状与未检查、故障数量；
 - ``POST /deicing-allocation``   提交计算时刻、库存批次与按优先级排列的作业需求，
-                                  返回逐项分配明细、批次剩余量与未参与的过期批次。
+                                  返回逐项分配明细、批次剩余量与未参与的过期批次；
+- ``POST /friction-assessment``  提交测量批次（批次编号、跑道、测量时刻与三个分段的
+                                  测点读数），返回各分段中位数与全跑道总体等级。
 
 服务端不保存任何请求间状态：响应完全由请求体决定，可复算、顺序稳定。
 """
@@ -24,16 +26,25 @@ from pydantic import BaseModel, ValidationError
 
 from app.domain import (
     EVENT_KINDS,
+    MIN_READINGS_PER_SEGMENT,
+    SEGMENTS,
     DeicingBatch,
     DeicingDemand,
     DuplicateIdentifierError,
+    DuplicateReadingError,
+    DuplicateSegmentError,
+    FrictionReading,
     InspectionEvent,
     InspectionPoint,
     InsufficientInventoryError,
+    InsufficientReadingsError,
     Occupancy,
+    SegmentReadings,
     SnapshotContradictionError,
+    UnknownSegmentError,
     WorkWindow,
     allocate_deicing,
+    assess_friction,
     build_inspection_snapshot,
     evaluate,
 )
@@ -45,9 +56,12 @@ from app.schemas import (
     DemandAllocationOut,
     EvaluationRequest,
     ExpiredBatchOut,
+    FrictionAssessmentOut,
+    FrictionAssessmentRequest,
     InspectionSnapshotOut,
     InspectionSnapshotRequest,
     PointStatusOut,
+    SegmentMedianOut,
     WorkWindowOut,
     serialize_utc_z_seconds,
 )
@@ -55,12 +69,13 @@ from app.schemas import (
 T = TypeVar("T", bound=BaseModel)
 
 app = FastAPI(
-    title="夜间跑道施工放行 / 灯光巡检 / 除冰液配给 API",
-    version="1.2.0",
+    title="夜间跑道施工放行 / 灯光巡检 / 除冰液配给 / 摩擦评定 API",
+    version="1.3.0",
     description=(
         "纯后端、无状态：航班占用两端各扩展十分钟后按半开区间判定冲突；"
         "巡检批次按截止时间把事件折叠为点位现状；"
-        "除冰液按计算时刻剔除过期批次后先到期先用、逐项配给。"
+        "除冰液按计算时刻剔除过期批次后先到期先用、逐项配给；"
+        "摩擦批次按分段中位数的最低值评定全跑道等级。"
     ),
 )
 
@@ -369,6 +384,168 @@ def _deicing_duplicate_errors(payload: object) -> list[dict]:
     return errors
 
 
+def _friction_assessment_errors(payload: object) -> list[dict]:
+    """摩擦测量批次的跨条目约束：跑道已声明、分段齐备、读数编号唯一。
+
+    与模型校验同样只在原始结构形态可识别时尽力提取（非字典条目、
+    非字符串编号等让位给 Pydantic 的字段级错误）；编号先按服务端
+    同样的规则去空白再比较，避免 ``" R-1 "`` 与 ``"R-1"`` 漏判。
+    分段名非法的条目由 Pydantic 的 Literal 校验报告，这里只按合法
+    分段名统计齐备性——因此非法分段对应的法定分段会同时报缺失，
+    两个根因一次返回。
+    """
+
+    if not isinstance(payload, dict):
+        return []
+
+    errors: list[dict] = []
+
+    declared = _declared_runways(payload)
+    runway = payload.get("runway")
+    if (
+        declared is not None
+        and isinstance(runway, str)
+        and runway.strip()
+        and runway.strip() not in declared
+    ):
+        errors.append(
+            {
+                "type": "unknown_runway",
+                "loc": ("body", "runway"),
+                "msg": f"跑道代码 {runway!r} 未在 runways 中声明",
+                "input": runway,
+                "ctx": {"runway": runway},
+            }
+        )
+
+    raw_segments = payload.get("segments")
+    if not isinstance(raw_segments, list):
+        return errors
+
+    counts: dict[str, int] = {}
+    seen_segments: dict[str, int] = {}
+    seen_readings: dict[str, tuple[int, int]] = {}
+    for seg_index, item in enumerate(raw_segments):
+        if not isinstance(item, dict):
+            continue
+        segment = item.get("segment")
+        if isinstance(segment, str) and segment in SEGMENTS:
+            if segment in seen_segments:
+                errors.append(
+                    {
+                        "type": "duplicate_segment",
+                        "loc": ("body", "segments", seg_index, "segment"),
+                        "msg": (
+                            f"分段 {segment!r} 重复提交，"
+                            f"首次出现于 segments[{seen_segments[segment]}]"
+                        ),
+                        "input": segment,
+                        "ctx": {
+                            "segment": segment,
+                            "first_index": seen_segments[segment],
+                        },
+                    }
+                )
+            else:
+                seen_segments[segment] = seg_index
+            raw_readings = item.get("readings")
+            if isinstance(raw_readings, list):
+                counts[segment] = counts.get(segment, 0) + len(raw_readings)
+                for reading_index, reading in enumerate(raw_readings):
+                    if not isinstance(reading, dict):
+                        continue
+                    raw_id = reading.get("reading_id")
+                    if not isinstance(raw_id, str) or not raw_id.strip():
+                        continue
+                    identifier = raw_id.strip()
+                    if identifier in seen_readings:
+                        first_seg, first_reading = seen_readings[identifier]
+                        errors.append(
+                            {
+                                "type": "duplicate_reading_id",
+                                "loc": (
+                                    "body",
+                                    "segments",
+                                    seg_index,
+                                    "readings",
+                                    reading_index,
+                                    "reading_id",
+                                ),
+                                "msg": (
+                                    f"读数编号 {identifier!r} 重复，首次出现于 "
+                                    f"segments[{first_seg}].readings[{first_reading}]"
+                                ),
+                                "input": raw_id,
+                                "ctx": {
+                                    "reading_id": identifier,
+                                    "first_segment_index": first_seg,
+                                    "first_reading_index": first_reading,
+                                },
+                            }
+                        )
+                    else:
+                        seen_readings[identifier] = (seg_index, reading_index)
+
+    for segment in SEGMENTS:
+        count = counts.get(segment, 0)
+        if count >= MIN_READINGS_PER_SEGMENT or segment not in seen_segments:
+            continue
+        errors.append(
+            {
+                "type": "insufficient_readings",
+                "loc": ("body", "segments", seen_segments[segment], "readings"),
+                "msg": f"分段 {segment!r} 只有 {count} 条读数，少于三条",
+                "input": count,
+                "ctx": {
+                    "segment": segment,
+                    "count": count,
+                    "min_readings": MIN_READINGS_PER_SEGMENT,
+                },
+            }
+        )
+
+    # 缺失的分段无法定位到具体条目，聚合为一条错误列出全部缺失分段，
+    # 保证一次请求里的所有字段级错误同时返回（loc 相同会被去重折叠）。
+    missing = [segment for segment in SEGMENTS if segment not in seen_segments]
+    if missing:
+        names = "、".join(repr(segment) for segment in missing)
+        errors.append(
+            {
+                "type": "insufficient_readings",
+                "loc": ("body", "segments"),
+                "msg": f"分段 {names} 缺失，读数 0 条少于三条",
+                "input": 0,
+                "ctx": {
+                    "missing_segments": missing,
+                    "count": 0,
+                    "min_readings": MIN_READINGS_PER_SEGMENT,
+                },
+            }
+        )
+    return errors
+
+
+def _friction_domain_errors(
+    exc: UnknownSegmentError
+    | DuplicateSegmentError
+    | InsufficientReadingsError
+    | DuplicateReadingError,
+) -> list[dict]:
+    """领域层摩擦校验失败的兜底 422 条目。
+
+    原始结构检查已先行拒绝全部同类问题，此处仅为兜底，正常不可达。
+    """
+
+    return [
+        {
+            "type": "invalid_friction_batch",
+            "loc": ("body",),
+            "msg": str(exc),
+            "input": None,
+        }
+    ]
+
+
 def _insufficient_inventory_errors(exc: InsufficientInventoryError) -> list[dict]:
     """把领域层的库存不足展开为指出总需求、有效库存与缺口的 422 条目。
 
@@ -661,4 +838,62 @@ async def deicing_allocation(request: Request) -> DeicingAllocationOut:
             )
             for e in report.expired_batches
         ],
+    )
+
+
+@app.post("/friction-assessment", response_model=FrictionAssessmentOut)
+async def friction_assessment(request: Request) -> FrictionAssessmentOut:
+    """按批次评定跑道摩擦：分段中位数取最低值，按阈值划总体等级。
+
+    请求体的小数按 ``Decimal`` 精确解析；任一分段缺失或少于三条读数、
+    分段重复或非法、读数编号重复、系数超出 0 至 1 或超过三位小数时
+    整批 422，不返回部分评定；读数输入顺序不影响结果。
+    """
+
+    req = _validate_payload(
+        await _parse_body(request, parse_float=Decimal),
+        FrictionAssessmentRequest,
+        _friction_assessment_errors,
+    )
+
+    segments = [
+        SegmentReadings(
+            segment=segment.segment,
+            readings=tuple(
+                FrictionReading(
+                    reading_id=reading.reading_id,
+                    coefficient=reading.coefficient,
+                )
+                for reading in segment.readings
+            ),
+        )
+        for segment in req.segments
+    ]
+
+    try:
+        assessment = assess_friction(
+            batch_id=req.batch_id,
+            runway=req.runway,
+            measured_at=req.measured_at,
+            segments=segments,
+        )
+    except (
+        UnknownSegmentError,
+        DuplicateSegmentError,
+        InsufficientReadingsError,
+        DuplicateReadingError,
+    ) as exc:
+        # 原始结构检查已先行拒绝全部同类问题，此处仅为兜底，正常不可达。
+        raise RequestValidationError(_friction_domain_errors(exc))
+
+    return FrictionAssessmentOut(
+        batch_id=assessment.batch_id,
+        runway=assessment.runway,
+        measured_at=assessment.measured_at,
+        segments=[
+            SegmentMedianOut(segment=median.segment, median=median.median)
+            for median in assessment.segments
+        ],
+        overall_coefficient=assessment.overall_coefficient,
+        overall_grade=assessment.overall_grade,
     )

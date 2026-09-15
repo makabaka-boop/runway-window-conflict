@@ -474,6 +474,162 @@ def main() -> int:
         token in error["msg"] for token in ("100.500", "60.000", "40.500")
     ), "缺货错误信息须带出总需求、有效库存与缺口"
 
+    # 16) 摩擦评定 —— 场景一：正常路面，三段中位数都在良好线以上
+    friction_good = {
+        "batch_id": "FR-20260915-01",
+        "runways": ["36L", "18R"],
+        "runway": "36L",
+        "measured_at": "2026-09-15T04:30:00Z",
+        "segments": [
+            {"segment": "touchdown", "readings": [
+                {"reading_id": "TD-1", "coefficient": 0.512},
+                {"reading_id": "TD-2", "coefficient": 0.508},
+                {"reading_id": "TD-3", "coefficient": 0.515},
+            ]},
+            {"segment": "midpoint", "readings": [
+                # 偶数条读数：中位数取中间两条均值 0.5115
+                {"reading_id": "MP-1", "coefficient": 0.4},
+                {"reading_id": "MP-2", "coefficient": 0.511},
+                {"reading_id": "MP-3", "coefficient": 0.512},
+                {"reading_id": "MP-4", "coefficient": 0.6},
+            ]},
+            {"segment": "rollout", "readings": [
+                {"reading_id": "RO-1", "coefficient": 0.455},
+                {"reading_id": "RO-2", "coefficient": 0.460},
+                {"reading_id": "RO-3", "coefficient": 0.450},
+            ]},
+        ],
+    }
+    status, body = request("POST", "/friction-assessment", friction_good)
+    assert_equal(status, 200, "摩擦评定场景一状态码")
+    assert_equal(body["batch_id"], "FR-20260915-01", "批次编号回显")
+    assert_equal(body["runway"], "36L", "跑道回显")
+    assert_equal(body["measured_at"], "2026-09-15T04:30:00Z", "测量时刻回显")
+    assert_equal(
+        body["segments"],
+        [
+            {"segment": "touchdown", "median": 0.512},
+            {"segment": "midpoint", "median": 0.5115},
+            {"segment": "rollout", "median": 0.455},
+        ],
+        "分段中位数按着陆段、中段、滑跑段固定顺序返回",
+    )
+    assert_equal(body["overall_coefficient"], 0.455, "全跑道结论取三段最低值")
+    assert_equal(body["overall_grade"], "good", "最低值不低于 0.400 为良好")
+
+    # 17) 摩擦评定 —— 场景二：临界等级，阈值恰取到归较高等级，低千分之一即降级
+    def friction_with_rollout(coefficients: list[float]) -> dict:
+        payload = dict(friction_good)
+        payload["segments"] = [
+            friction_good["segments"][0],
+            friction_good["segments"][1],
+            {
+                "segment": "rollout",
+                "readings": [
+                    {"reading_id": f"RO-{index}", "coefficient": coefficient}
+                    for index, coefficient in enumerate(coefficients, start=1)
+                ],
+            },
+        ]
+        return payload
+
+    boundary_cases = [
+        ([0.400, 0.401, 0.399], 0.4, "good"),
+        ([0.399, 0.400, 0.398], 0.399, "restricted"),
+        ([0.250, 0.251, 0.249], 0.25, "restricted"),
+        ([0.249, 0.250, 0.248], 0.249, "poor"),
+    ]
+    for rollout, expected_coefficient, expected_grade in boundary_cases:
+        status, body = request(
+            "POST", "/friction-assessment", friction_with_rollout(rollout)
+        )
+        assert_equal(status, 200, f"临界等级 {rollout} 状态码")
+        assert_equal(
+            body["overall_coefficient"], expected_coefficient, f"临界等级 {rollout} 最低值"
+        )
+        assert_equal(body["overall_grade"], expected_grade, f"临界等级 {rollout} 定级")
+
+    # 18) 摩擦评定 —— 场景三：乱序稳定，分段与读数乱序提交响应逐字节一致
+    friction_shuffled = dict(friction_good)
+    friction_shuffled["segments"] = [
+        {"segment": "rollout", "readings": [
+            {"reading_id": "RO-3", "coefficient": 0.450},
+            {"reading_id": "RO-1", "coefficient": 0.455},
+            {"reading_id": "RO-2", "coefficient": 0.460},
+        ]},
+        {"segment": "midpoint", "readings": [
+            {"reading_id": "MP-4", "coefficient": 0.6},
+            {"reading_id": "MP-2", "coefficient": 0.511},
+            {"reading_id": "MP-1", "coefficient": 0.4},
+            {"reading_id": "MP-3", "coefficient": 0.512},
+        ]},
+        {"segment": "touchdown", "readings": [
+            {"reading_id": "TD-3", "coefficient": 0.515},
+            {"reading_id": "TD-1", "coefficient": 0.512},
+            {"reading_id": "TD-2", "coefficient": 0.508},
+        ]},
+    ]
+    status, body_ordered = request("POST", "/friction-assessment", friction_good)
+    assert_equal(status, 200, "摩擦评定正序请求状态码")
+    status, body_shuffled = request("POST", "/friction-assessment", friction_shuffled)
+    assert_equal(status, 200, "摩擦评定乱序请求状态码")
+    assert_equal(body_shuffled, body_ordered, "读数与分段输入顺序不影响评定结果")
+
+    # 19) 摩擦评定 —— 场景四：整批拒绝，多重问题聚合 422 且无部分评定
+    friction_bad = {
+        "batch_id": "FR-20260915-02",
+        "runways": ["36L"],
+        "runway": "18L",  # 未声明跑道
+        "measured_at": "2026-09-15T04:30:00Z",
+        "segments": [
+            {"segment": "touchdown", "readings": [
+                # 只有两条读数，且第二条系数超出 0 至 1
+                {"reading_id": "TD-1", "coefficient": 0.512},
+                {"reading_id": "TD-2", "coefficient": 1.5},
+            ]},
+            {"segment": "sidewalk", "readings": [  # 非法分段
+                {"reading_id": "X-1", "coefficient": 0.4},
+                {"reading_id": "X-2", "coefficient": 0.4},
+                {"reading_id": "X-3", "coefficient": 0.4},
+            ]},
+            {"segment": "rollout", "readings": [
+                {"reading_id": "TD-1", "coefficient": 0.455},  # 编号与着陆段重复
+                {"reading_id": "RO-2", "coefficient": 0.460},
+                {"reading_id": "RO-3", "coefficient": 0.450},
+            ]},
+        ],
+    }
+    status, body = request("POST", "/friction-assessment", friction_bad)
+    assert_equal(status, 422, "非法摩擦批次必须整批 422")
+    assert_equal(set(body.keys()), {"detail"}, "整批拒绝时无部分评定字段")
+    loc_types = {(tuple(e["loc"]), e["type"]) for e in body["detail"]}
+    assert (
+        ("body", "runway"), "unknown_runway"
+    ) in loc_types, f"未声明跑道应为字段级错误，实际: {loc_types}"
+    assert (
+        ("body", "segments", 0, "readings"), "insufficient_readings"
+    ) in loc_types, f"读数不足三条须定位到分段，实际: {loc_types}"
+    assert (
+        ("body", "segments", 0, "readings", 1, "coefficient"),
+        "coefficient_out_of_range",
+    ) in loc_types, f"系数超界须定位到读数，实际: {loc_types}"
+    assert (
+        ("body", "segments", 1, "segment"), "literal_error"
+    ) in loc_types, f"非法分段须定位到分段名，实际: {loc_types}"
+    assert (
+        ("body", "segments", 2, "readings", 0, "reading_id"),
+        "duplicate_reading_id",
+    ) in loc_types, f"重复编号须定位到读数，实际: {loc_types}"
+    # 非法分段导致中段没有任何合法读数，缺失分段聚合报告
+    missing = [
+        e
+        for e in body["detail"]
+        if e["type"] == "insufficient_readings" and e["loc"] == ["body", "segments"]
+    ]
+    assert missing and missing[0]["ctx"]["missing_segments"] == [
+        "midpoint"
+    ], f"缺失分段须聚合报告，实际: {body['detail']}"
+
     print("smoke_http: 全部断言通过")
     return 0
 

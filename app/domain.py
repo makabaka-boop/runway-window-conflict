@@ -1,4 +1,4 @@
-"""跑道施工冲突判定、跑道灯光巡检快照与除冰液配给的纯领域逻辑。
+"""跑道施工冲突判定、跑道灯光巡检快照、除冰液配给与跑道摩擦批次评定的纯领域逻辑。
 
 本模块只依赖标准库，不感知 HTTP / Pydantic，便于直接单测。
 
@@ -28,6 +28,19 @@
 - 数量统一按三位小数（``Decimal``）精确计算；
 - 批次编号 / 作业编号重复、有效库存总量小于总需求时整次失败，
   不返回部分配给。
+
+摩擦批次评定规则：
+
+- 测点读数按分段（着陆段 / 中段 / 滑跑段）分组，分段内按系数排序取中位数，
+  读数输入顺序不影响结果；
+- 中位数以 ``Decimal`` 精确计算：奇数条取中间值，偶数条取中间两条的均值
+  （三位小数系数的均值最多四位小数，除二恒精确）；
+- 全跑道结论取三段中位数的最低值，系数不低于 0.400 为良好（``good``）、
+  不低于 0.250 为受限（``restricted``）、其余为较差（``poor``）；
+- 任一分段缺失或少于三条读数、分段重复、分段名非法、读数编号重复时
+  整次失败，不返回部分评定；
+- 系数取值域（0 至 1、最多三位小数）由调用方约束（API 层强制），
+  与除冰液数量的三位小数约束同一分工。
 """
 
 from __future__ import annotations
@@ -567,3 +580,197 @@ def allocate_deicing(
                 for b in expired
             ),
         )
+
+
+# ---------------------------------------------------------------------------
+# 跑道摩擦测量批次评定
+# ---------------------------------------------------------------------------
+
+#: 法定分段：着陆段。
+SEGMENT_TOUCHDOWN = "touchdown"
+#: 法定分段：中段。
+SEGMENT_MIDPOINT = "midpoint"
+#: 法定分段：滑跑段。
+SEGMENT_ROLLOUT = "rollout"
+
+#: 三个法定分段的规范顺序，响应固定按此顺序给出中位数。
+SEGMENTS: tuple[str, ...] = (SEGMENT_TOUCHDOWN, SEGMENT_MIDPOINT, SEGMENT_ROLLOUT)
+
+#: 总体等级：良好（最低中位数不低于 0.400）。
+GRADE_GOOD = "good"
+#: 总体等级：受限（最低中位数不低于 0.250 但低于 0.400）。
+GRADE_RESTRICTED = "restricted"
+#: 总体等级：较差（最低中位数低于 0.250）。
+GRADE_POOR = "poor"
+
+#: 良好等级的下限（含）。
+FRICTION_GOOD_THRESHOLD = Decimal("0.400")
+#: 受限等级的下限（含）。
+FRICTION_RESTRICTED_THRESHOLD = Decimal("0.250")
+
+#: 每个分段参与评定的最少读数条数。
+MIN_READINGS_PER_SEGMENT = 3
+
+
+@dataclass(frozen=True)
+class FrictionReading:
+    """一条测点读数：批次内唯一编号 + 三位小数摩擦系数。"""
+
+    reading_id: str
+    coefficient: Decimal
+
+
+@dataclass(frozen=True)
+class SegmentReadings:
+    """一个分段提交的全部测点读数。"""
+
+    segment: str
+    readings: tuple[FrictionReading, ...]
+
+
+@dataclass(frozen=True)
+class SegmentMedian:
+    """一个分段的评定中位数。"""
+
+    segment: str
+    median: Decimal
+
+
+@dataclass(frozen=True)
+class FrictionAssessment:
+    """一次摩擦测量批次的完整评定结论。
+
+    ``segments`` 固定按 :data:`SEGMENTS` 顺序排列；
+    ``overall_coefficient`` 为三段中位数的最低值，``overall_grade``
+    是它按阈值划出的全跑道等级。
+    """
+
+    batch_id: str
+    runway: str
+    measured_at: datetime
+    segments: tuple[SegmentMedian, ...]
+    overall_coefficient: Decimal
+    overall_grade: str
+
+
+class UnknownSegmentError(ValueError):
+    """分段名不是三个法定分段之一，整次请求必须失败。"""
+
+    def __init__(self, segment: str) -> None:
+        self.segment = segment
+        super().__init__(f"分段非法: {segment}")
+
+
+class DuplicateSegmentError(ValueError):
+    """同一分段被重复提交，整次请求必须失败。"""
+
+    def __init__(self, segment: str) -> None:
+        self.segment = segment
+        super().__init__(f"分段重复提交: {segment}")
+
+
+class InsufficientReadingsError(ValueError):
+    """分段缺失或读数少于三条，整次请求失败且不返回部分评定。"""
+
+    def __init__(self, segment: str, count: int) -> None:
+        self.segment = segment
+        self.count = count
+        super().__init__(f"分段 {segment} 只有 {count} 条读数，少于三条")
+
+
+class DuplicateReadingError(ValueError):
+    """读数编号在批次内重复，整次请求必须失败。"""
+
+    def __init__(self, reading_id: str) -> None:
+        self.reading_id = reading_id
+        super().__init__(f"读数编号重复: {reading_id}")
+
+
+def grade_for(coefficient: Decimal) -> str:
+    """按阈值把摩擦系数划为等级：>= 0.400 良好，>= 0.250 受限，其余较差。"""
+
+    if coefficient >= FRICTION_GOOD_THRESHOLD:
+        return GRADE_GOOD
+    if coefficient >= FRICTION_RESTRICTED_THRESHOLD:
+        return GRADE_RESTRICTED
+    return GRADE_POOR
+
+
+def _median(coefficients: list[Decimal]) -> Decimal:
+    """以 ``Decimal`` 精确计算中位数；输入顺序不影响结果。
+
+    奇数条取排序后的中间值；偶数条取中间两条的均值。三位小数系数
+    两两之和仍精确，除以二恒为有限小数（最多四位小数），无需舍入。
+    调用方保证列表非空（分段至少三条读数已先行校验）。
+    """
+
+    ordered = sorted(coefficients)
+    count = len(ordered)
+    middle = count // 2
+    if count % 2 == 1:
+        return ordered[middle]
+    with localcontext() as context:
+        context.prec = _DOMAIN_DECIMAL_PRECISION
+        return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def assess_friction(
+    batch_id: str,
+    runway: str,
+    measured_at: datetime,
+    segments: list[SegmentReadings],
+) -> FrictionAssessment:
+    """对一个摩擦测量批次给出整批评定结论。
+
+    流程（顺序很重要）：
+
+    1. 分段名必须是 :data:`SEGMENTS` 之一（:class:`UnknownSegmentError`），
+       且同一分段不得重复提交（:class:`DuplicateSegmentError`）；
+    2. 三个法定分段都必须出现且各至少三条读数，缺失按零条计
+       （:class:`InsufficientReadingsError`）；
+    3. 读数编号在整个批次内唯一（:class:`DuplicateReadingError`）；
+    4. 各分段读数按系数排序取中位数——读数输入顺序不影响结果；
+    5. 三段中位数的最低值即全跑道结论，按阈值划出总体等级。
+
+    系数取值域（0 至 1、最多三位小数）由调用方约束（API 层强制）。
+    本函数是纯函数：相同输入永远得到相同、顺序稳定的输出。
+    """
+
+    seen_segments: set[str] = set()
+    for segment in segments:
+        if segment.segment not in SEGMENTS:
+            raise UnknownSegmentError(segment.segment)
+        if segment.segment in seen_segments:
+            raise DuplicateSegmentError(segment.segment)
+        seen_segments.add(segment.segment)
+
+    by_segment = {segment.segment: segment for segment in segments}
+    for name in SEGMENTS:
+        segment = by_segment.get(name)
+        count = len(segment.readings) if segment is not None else 0
+        if count < MIN_READINGS_PER_SEGMENT:
+            raise InsufficientReadingsError(name, count)
+
+    seen_readings: set[str] = set()
+    for segment in segments:
+        for reading in segment.readings:
+            if reading.reading_id in seen_readings:
+                raise DuplicateReadingError(reading.reading_id)
+            seen_readings.add(reading.reading_id)
+
+    medians = tuple(
+        SegmentMedian(
+            segment=name,
+            median=_median([r.coefficient for r in by_segment[name].readings]),
+        )
+        for name in SEGMENTS
+    )
+    overall = min(median.median for median in medians)
+    return FrictionAssessment(
+        batch_id=batch_id,
+        runway=runway,
+        measured_at=measured_at,
+        segments=medians,
+        overall_coefficient=overall,
+        overall_grade=grade_for(overall),
+    )

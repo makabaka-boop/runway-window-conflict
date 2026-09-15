@@ -1,4 +1,4 @@
-# 夜间跑道施工放行评估 / 灯光巡检快照 / 除冰液配给 API
+# 夜间跑道施工放行评估 / 灯光巡检快照 / 除冰液配给 / 摩擦批次评定 API
 
 无状态纯后端服务：
 
@@ -7,7 +7,9 @@
 - 一次 **`POST /inspection-snapshot`** 请求提交**巡检批次**（应查点位 + 按发生时间记录的
   正常 / 故障 / 已修复事件），服务按批次截止时间把事件折叠为各点位现状；
 - 一次 **`POST /deicing-allocation`** 请求提交**计算时刻**、**除冰液库存批次**与
-  **按优先级排列的作业需求**，服务返回逐项分配明细、批次剩余量与未参与的过期批次。
+  **按优先级排列的作业需求**，服务返回逐项分配明细、批次剩余量与未参与的过期批次；
+- 一次 **`POST /friction-assessment`** 请求提交**测量批次**（批次编号、跑道、测量时刻与
+  着陆段 / 中段 / 滑跑段的测点读数），服务返回各分段中位数与全跑道总体等级。
 
 响应完全由请求体决定，可复算、顺序稳定，不依赖任何数据库或请求间状态。
 
@@ -268,6 +270,96 @@ THR-C 的修复发生在截止之后、不参与快照，计为未检查。
 }
 ```
 
+## 跑道摩擦测量批次评定
+
+`POST /friction-assessment` 供雨雪后塔台取得可复算的跑道摩擦结论：客户端提交
+**测量批次**（批次编号、已声明跑道集合、实施测量的跑道、测量时刻）与**三个分段的
+测点读数**（着陆段 `touchdown`、中段 `midpoint`、滑跑段 `rollout`，每条读数含
+批次内唯一编号与三位小数摩擦系数），服务整批评定并返回各分段中位数与全跑道总体等级。
+
+评定规则：
+
+1. **分段中位数**：各分段读数按系数排序取中位数，以十进制 `Decimal` 精确计算——
+   奇数条取中间值，偶数条取中间两条的均值（三位小数系数的均值最多四位小数，
+   除二恒精确，无舍入）；**读数与分段的输入顺序不影响结果**；
+2. **最低值定级**：全跑道结论取三段中位数的**最低值**，系数不低于 `0.400` 为
+   `good`（良好），不低于 `0.250` 为 `restricted`（受限），其余为 `poor`（较差）；
+   阈值恰取到即归入较高等级（`0.400` 为良好、`0.250` 为受限、`0.249` 为较差）；
+3. **读数约束**：每条读数编号在整个批次内唯一（去空白后比较）；系数为 0 至 1
+   （含端点）的有限数值、最多三位小数（`0.5100` 这类末尾带零的写法按数值本身判定）；
+4. **分段齐备**：着陆段 / 中段 / 滑跑段必须各出现恰好一次，且每段至少三条读数；
+   分段名非法、分段重复、分段缺失或读数不足三条时整批 422；
+5. **整批拒绝**：上述任一约束不满足、跑道未在 `runways` 中声明、时间格式非法时，
+   整次请求返回 HTTP 422 字段级错误，**不生成任何部分评定**；同一次请求的多个
+   错误聚合在一个响应中，定位到对应分段（`segments[i]`）或读数
+   （`segments[i].readings[j]`）；多个缺失分段聚合为一条错误一次列出；
+6. 响应中 `segments` 固定按着陆段、中段、滑跑段顺序给出中位数，
+   `overall_coefficient` 为三段最低值、`overall_grade` 为总体等级；
+   时间沿用严格的带 `Z` UTC 秒级格式，系数为 JSON 数值。
+
+请求示例：
+
+```json
+{
+  "batch_id": "FR-20260915-01",
+  "runways": ["36L", "18R"],
+  "runway": "36L",
+  "measured_at": "2026-09-15T04:30:00Z",
+  "segments": [
+    {"segment": "touchdown", "readings": [
+      {"reading_id": "TD-1", "coefficient": 0.512},
+      {"reading_id": "TD-2", "coefficient": 0.508},
+      {"reading_id": "TD-3", "coefficient": 0.515}
+    ]},
+    {"segment": "midpoint", "readings": [
+      {"reading_id": "MP-1", "coefficient": 0.400},
+      {"reading_id": "MP-2", "coefficient": 0.511},
+      {"reading_id": "MP-3", "coefficient": 0.512},
+      {"reading_id": "MP-4", "coefficient": 0.600}
+    ]},
+    {"segment": "rollout", "readings": [
+      {"reading_id": "RO-1", "coefficient": 0.455},
+      {"reading_id": "RO-2", "coefficient": 0.460},
+      {"reading_id": "RO-3", "coefficient": 0.450}
+    ]}
+  ]
+}
+```
+
+响应（`200 OK`）：中段四条读数的中位数取中间两条均值 0.5115；
+全跑道结论为三段最低值 0.455，不低于 0.400，总体良好。
+
+```json
+{
+  "batch_id": "FR-20260915-01",
+  "runway": "36L",
+  "measured_at": "2026-09-15T04:30:00Z",
+  "segments": [
+    {"segment": "touchdown", "median": 0.512},
+    {"segment": "midpoint", "median": 0.5115},
+    {"segment": "rollout", "median": 0.455}
+  ],
+  "overall_coefficient": 0.455,
+  "overall_grade": "good"
+}
+```
+
+整批拒绝时返回字段级 422（无部分评定，错误定位到对应分段或读数）：
+
+```json
+{
+  "detail": [
+    {"type": "insufficient_readings", "loc": ["body", "segments", 0, "readings"],
+     "msg": "分段 'touchdown' 只有 2 条读数，少于三条", "input": 2,
+     "ctx": {"segment": "touchdown", "count": 2, "min_readings": 3}},
+    {"type": "coefficient_out_of_range", "loc": ["body", "segments", 0, "readings", 1, "coefficient"],
+     "msg": "摩擦系数必须在 0 至 1 之间（含端点），收到 1.5", "input": 1.5},
+    {"type": "duplicate_reading_id", "loc": ["body", "segments", 2, "readings", 0, "reading_id"],
+     "msg": "读数编号 'TD-1' 重复，首次出现于 segments[0].readings[0]", "input": "TD-1"}
+  ]
+}
+```
+
 ## 运行
 
 仅启动 API（容器内监听 8000，默认宿主端口 8000）：
@@ -283,6 +375,7 @@ API_PORT=18080 docker compose up --build
 - 评估接口：`POST http://localhost:8000/evaluate`
 - 巡检快照接口：`POST http://localhost:8000/inspection-snapshot`
 - 除冰液配给接口：`POST http://localhost:8000/deicing-allocation`
+- 摩擦评定接口：`POST http://localhost:8000/friction-assessment`
 
 ### 一次性验收服务 verify
 
@@ -297,7 +390,8 @@ docker compose run --rm verify
 1. 等待 `api` 健康检查通过；
 2. 在容器内执行全部 pytest（临界相接、侵入一秒、跨日区间、跑道隔离、排序稳定性、各类 422，
    以及巡检快照四组确定性场景：未检查 / 故障后修复 / 截止后修复仍故障 / 同秒矛盾 422，
-   以及除冰液配给四组确定性场景：足量单批次 / 跨批次拆分 / 过期批次排除 / 库存不足）；
+   以及除冰液配给四组确定性场景：足量单批次 / 跨批次拆分 / 过期批次排除 / 库存不足，
+   以及摩擦批次评定四组确定性场景：正常路面 / 临界等级 / 乱序稳定 / 整批拒绝）；
 3. 对运行中的 API 执行 `scripts/smoke_http.py`（零第三方依赖，断言真实 HTTP 响应）。
 
 ### 本地直接运行（不用 Docker）
@@ -316,14 +410,16 @@ API_BASE_URL=http://127.0.0.1:8000 python scripts/smoke_http.py
 
 ```
 app/
-  domain.py     # 纯领域逻辑：十分钟扩展、半开相交、排序、巡检事件折叠、除冰液配给（无第三方依赖）
-  schemas.py    # Pydantic 请求/响应模型、Z 秒级时间、三位小数数量与字段级约束
-  main.py       # FastAPI 装配、422 错误聚合、无状态 /evaluate、/inspection-snapshot 与 /deicing-allocation
+  domain.py     # 纯领域逻辑：十分钟扩展、半开相交、排序、巡检事件折叠、除冰液配给、摩擦批次评定（无第三方依赖）
+  schemas.py    # Pydantic 请求/响应模型、Z 秒级时间、三位小数数量/系数与字段级约束
+  main.py       # FastAPI 装配、422 错误聚合、无状态 /evaluate、/inspection-snapshot、/deicing-allocation 与 /friction-assessment
 tests/
   test_domain.py
   test_api.py
   test_deicing_domain.py
   test_deicing_api.py
+  test_friction_domain.py
+  test_friction_api.py
   test_schemas.py
 scripts/
   smoke_http.py # verify 服务使用的真实 HTTP 冒烟脚本（仅标准库）
